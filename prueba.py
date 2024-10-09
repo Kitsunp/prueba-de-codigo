@@ -7,9 +7,9 @@ from transformers import GPT2Tokenizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
-from torch.utils.checkpoint import checkpoint
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.checkpoint import checkpoint  # Importar checkpoint
 import math
 import os
 import re
@@ -35,7 +35,7 @@ class MoELayer(nn.Module):
         return output.view(batch_size, seq_length, -1)
 
 class LiquidEmbedding(nn.Module):
-    def __init__(self, vocab_size, embed_dim, max_length=2048, compression_ratio=0.25):
+    def __init__(self, vocab_size, embed_dim, max_length=2048, compression_ratio=0.5):  # Aumentar compression_ratio a 0.5
         super(LiquidEmbedding, self).__init__()
         self.embed_dim = embed_dim
         self.compression_ratio = compression_ratio
@@ -49,26 +49,28 @@ class LiquidEmbedding(nn.Module):
         batch_size, seq_length = x.size()
         device = x.device
         positions = torch.arange(0, seq_length, device=device).unsqueeze(0).expand(batch_size, seq_length)
-        x = self.token_embedding(x) + self.position_embedding(positions)
-        x = x.permute(0, 2, 1)
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = x.permute(0, 2, 1)
+        x = self.token_embedding(x) + self.position_embedding(positions)  # [batch_size, seq_length, embed_dim]
+        x = self.conv1(x.permute(0, 2, 1))  # [batch_size, embed_dim, seq_length]
+        x = F.relu(x)
+        x = self.conv2(x)  # [batch_size, embed_dim, seq_length]
+        x = F.relu(x)
+        x = x.permute(0, 2, 1)  # [batch_size, seq_length, embed_dim]
         x = x.to(torch.float32)
         x_fft = torch.fft.fft(x, dim=1)
         N = int(self.compression_ratio * (seq_length // 2 + 1))
-        x_fft_compressed = x_fft[:, :N, :]
-        x_ifft = torch.fft.ifft(x_fft_compressed, n=None, dim=1).real
+        x_fft_compressed = x_fft[:, :N, :]  # [batch_size, N, embed_dim]
+        x_ifft = torch.fft.ifft(x_fft_compressed, n=None, dim=1).real  # [batch_size, N, embed_dim]
         x_ifft = x_ifft.to(x.dtype)
-        x = self.proj(x_ifft)
+        x = self.proj(x_ifft)  # [batch_size, N, embed_dim]
         return x
 
-class EfficientLocalAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, window_size=256):
-        super(EfficientLocalAttention, self).__init__()
+class EnhancedLocalAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads, window_size=256, bidirectional=True):
+        super(EnhancedLocalAttention, self).__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.window_size = window_size
+        self.bidirectional = bidirectional
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
         self.qkv = nn.Linear(embed_dim, embed_dim * 3)
@@ -77,23 +79,34 @@ class EfficientLocalAttention(nn.Module):
     def forward(self, x):
         B, L, C = x.shape
         pad_l = (self.window_size - L % self.window_size) % self.window_size
-        x = F.pad(x, (0, 0, 0, pad_l))
+        x = F.pad(x, (0, 0, 0, pad_l))  # [B, L_padded, C]
         _, L_padded, _ = x.shape
         
         qkv = self.qkv(x).reshape(B, L_padded, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, L_padded, head_dim]
         
-        q = q.reshape(B, self.num_heads, L_padded // self.window_size, self.window_size, self.head_dim)
-        k = k.reshape(B, self.num_heads, L_padded // self.window_size, self.window_size, self.head_dim)
-        v = v.reshape(B, self.num_heads, L_padded // self.window_size, self.window_size, self.head_dim)
+        if self.bidirectional:
+            overlapping_size = self.window_size // 2  # 128
+            step = overlapping_size  # 128
+            window_size = self.window_size  # 256
+            # Realizar un solo unfold con step=128 para crear ventanas superpuestas
+            q = q.unfold(2, window_size, step).contiguous()  # [B, num_heads, num_windows, window_size, head_dim]
+            k = k.unfold(2, window_size, step).contiguous()
+            v = v.unfold(2, window_size, step).contiguous()
+        else:
+            q = q.unfold(2, self.window_size, self.window_size).contiguous()  # [B, num_heads, num_windows, window_size, head_dim]
+            k = k.unfold(2, self.window_size, self.window_size).contiguous()
+            v = v.unfold(2, self.window_size, self.window_size).contiguous()
         
-        attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        # Calcular la atención
+        attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)  # [B, num_heads, num_windows, window_size, window_size]
         attn = F.softmax(attn, dim=-1)
         
-        x = (attn @ v).transpose(1, 2).reshape(B, L_padded, C)
-        x = self.out(x)
+        # Aplicar la atención a los valores
+        x = (attn @ v).reshape(B, self.num_heads, -1, self.head_dim).permute(0, 2, 1, 3).reshape(B, -1, C)  # [B, L_padded, C]
+        x = self.out(x)  # [B, L_padded, C]
         
-        return x[:, :L]
+        return x[:, :L]  # [B, L, C]
 
 class DilatedConvolution(nn.Module):
     def __init__(self, channels, kernel_size, dilation):
@@ -104,9 +117,9 @@ class DilatedConvolution(nn.Module):
         return self.conv(x.transpose(1, 2)).transpose(1, 2)
 
 class ImprovedTransformerBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, ff_hidden_dim, num_experts, expert_dim, window_size=256):
+    def __init__(self, embed_dim, num_heads, ff_hidden_dim, num_experts, expert_dim, window_size=256, bidirectional=True):
         super(ImprovedTransformerBlock, self).__init__()
-        self.attention = EfficientLocalAttention(embed_dim, num_heads, window_size)
+        self.attention = EnhancedLocalAttention(embed_dim, num_heads, window_size, bidirectional)
         self.norm1 = nn.LayerNorm(embed_dim)
         self.dilated_conv = DilatedConvolution(embed_dim, kernel_size=3, dilation=2)
         self.norm2 = nn.LayerNorm(embed_dim)
@@ -122,18 +135,51 @@ class ImprovedTransformerBlock(nn.Module):
         return checkpoint(self._forward, x)
     
     def _forward(self, x):
+        print(f"Input to ImprovedTransformerBlock: {x.shape}")
         x = x + self.attention(self.norm1(x))
+        print(f"After attention: {x.shape}")
         x = x + self.dilated_conv(self.norm2(x))
+        print(f"After dilated convolution: {x.shape}")
         x = x + self.moe(self.norm3(x))
-        return x + self.ff_layer(x)
+        print(f"After MoE: {x.shape}")
+        x = x + self.ff_layer(x)
+        print(f"After feed-forward: {x.shape}")
+        return x
+
+class BidirectionalEncoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, max_length=2048, compression_ratio=0.5, num_layers=4, num_heads=8, ff_hidden_dim=1024, window_size=256):
+        super(BidirectionalEncoder, self).__init__()
+        self.embedding = LiquidEmbedding(vocab_size, embed_dim, max_length, compression_ratio)
+        self.layers = nn.ModuleList([
+            ImprovedTransformerBlock(embed_dim, num_heads, ff_hidden_dim, num_experts=2, expert_dim=256, window_size=window_size, bidirectional=True)
+            for _ in range(num_layers)
+        ])
+        self.layer_norm = nn.LayerNorm(embed_dim)
+    
+    def forward(self, x):
+        x = self.embedding(x)  # [batch_size, N=64, embed_dim=256]
+        for layer in self.layers:
+            x = layer(x)
+        x = self.layer_norm(x)
+        return x
 
 class LiquidFoundationModelOptimized(nn.Module):
     def __init__(self, vocab_size, embed_dim=256, num_layers=4, num_heads=8, ff_hidden_dim=1024,
-                 num_experts=2, expert_dim=256, max_length=2048, window_size=256, compression_ratio=0.25):
+                 num_experts=2, expert_dim=256, max_length=2048, window_size=256, compression_ratio=0.5):
         super(LiquidFoundationModelOptimized, self).__init__()
-        self.embedding = LiquidEmbedding(vocab_size, embed_dim, max_length, compression_ratio)
-        self.layers = nn.ModuleList([
-            ImprovedTransformerBlock(embed_dim, num_heads, ff_hidden_dim, num_experts, expert_dim, window_size)
+        self.encoder = BidirectionalEncoder(
+            vocab_size=vocab_size,
+            embed_dim=embed_dim,
+            max_length=max_length,
+            compression_ratio=compression_ratio,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_hidden_dim=ff_hidden_dim,
+            window_size=window_size
+        )
+        self.decoder_embedding = LiquidEmbedding(vocab_size, embed_dim, max_length, compression_ratio)
+        self.decoder_layers = nn.ModuleList([
+            ImprovedTransformerBlock(embed_dim, num_heads, ff_hidden_dim, num_experts, expert_dim, window_size, bidirectional=False)
             for _ in range(num_layers)
         ])
         self.layer_norm = nn.LayerNorm(embed_dim)
@@ -141,15 +187,18 @@ class LiquidFoundationModelOptimized(nn.Module):
         self.max_length = max_length
         self.compression_ratio = compression_ratio
 
-    def forward(self, x):
-        batch_size, original_seq_length = x.size()
-        x = self.embedding(x)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.layer_norm(x)
-        logits = self.output_layer(x)
-        logits = F.interpolate(logits.permute(0, 2, 1), size=original_seq_length, mode='linear', align_corners=False)
-        return logits.permute(0, 2, 1)
+    def forward(self, encoder_input_ids, decoder_input_ids):
+        # Encoder
+        encoder_output = self.encoder(encoder_input_ids)  # [batch_size, N=64, embed_dim=256]
+        
+        # Decoder
+        decoder_embeddings = self.decoder_embedding(decoder_input_ids)  # [batch_size, N=64, embed_dim=256]
+        for layer in self.decoder_layers:
+            decoder_embeddings = layer(decoder_embeddings)
+        decoder_embeddings = self.layer_norm(decoder_embeddings)
+        logits = self.output_layer(decoder_embeddings)  # [batch_size, N=64, vocab_size]
+        logits = F.interpolate(logits.permute(0, 2, 1), size=decoder_input_ids.size(1), mode='linear', align_corners=False)
+        return logits.permute(0, 2, 1)  # [batch_size, seq_length, vocab_size]
 
 from sklearn.model_selection import train_test_split
 
@@ -184,10 +233,11 @@ def calculate_perplexity(model, data_loader, criterion, device):
     total_tokens = 0
     with torch.no_grad():
         for batch in data_loader:
-            input_ids = batch['input_ids'].to(device)
-            outputs = model(input_ids)
+            encoder_input_ids = batch['input_ids'].to(device)
+            decoder_input_ids = batch['input_ids'].to(device)  # Asumiendo que la tarea es generación de texto
+            outputs = model(encoder_input_ids, decoder_input_ids)
             outputs = outputs.reshape(-1, outputs.size(-1))
-            targets = input_ids.reshape(-1)
+            targets = decoder_input_ids.reshape(-1)
             loss = criterion(outputs, targets)
             total_loss += loss.item() * targets.numel()
             total_tokens += targets.numel()
@@ -208,13 +258,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         loop = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Entrenando Epoch {epoch + 1}")
 
         for batch_idx, batch in loop:
-            input_ids = batch['input_ids'].to(device)
+            encoder_input_ids = batch['input_ids'].to(device)
+            decoder_input_ids = batch['input_ids'].to(device)  # Ajusta según tu tarea
 
-            # Ajuste aquí: Eliminamos 'device_type' de autocast
+            # Ajuste: Eliminamos 'device_type' de autocast y especificamos solo dtype
             with autocast(dtype=torch.float16 if device.type == 'cuda' else torch.float32):
-                outputs = model(input_ids)
+                outputs = model(encoder_input_ids, decoder_input_ids)
                 outputs = outputs.reshape(-1, outputs.size(-1))
-                targets = input_ids.reshape(-1)
+                targets = decoder_input_ids.reshape(-1)
                 loss = criterion(outputs, targets)
                 loss = loss / accumulation_steps
 
@@ -258,124 +309,157 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     writer.close()
 
 @torch.no_grad()
-def unified_generate(model, tokenizer, prompt, device, reasoning=True, max_length=512, beam_width=5, temperature=1.0, top_p=0.9, repetition_penalty=1.2, max_step_tokens=70, max_answer_tokens=30, top_k=50, num_steps=4, max_attempts=4):
+def unified_generate(model, tokenizer, prompt, device, reasoning=True, max_length=512, beam_width=5, temperature=1.0, top_p=0.9, repetition_penalty=1.2, max_step_tokens=70, max_answer_tokens=30, top_k=50, num_steps=4, max_attempts=4, num_iterations=3):
     """
-    Método unificado para generar respuestas, manejando razonamiento de Chain of Thought (CoT).
+    Método unificado para generar respuestas con refinamiento iterativo y memoria.
     
     - reasoning: Si es True, utiliza un enfoque de razonamiento paso a paso (Chain of Thought).
+    - num_iterations: Número de iteraciones para refinar la generación.
+    """
+    if not reasoning:
+        raise NotImplementedError("El modo general ha sido eliminado. Utiliza el modo 'cot' para generación.")
+
+    best_overall_response = ""
+    best_overall_cot_steps = []
+    best_overall_coherence = float('-inf')
+
+    for iteration in range(num_iterations):
+        print(f"Iteración {iteration + 1}/{num_iterations}")
+        response, cot_steps, coherence_score = generate_cot(
+            model, tokenizer, prompt, device, 
+            max_step_tokens=max_step_tokens, 
+            max_answer_tokens=max_answer_tokens, 
+            temperature=temperature, 
+            top_k=top_k, 
+            num_steps=num_steps, 
+            max_attempts=max_attempts,
+            beam_width=beam_width,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty
+        )
+        print(f"Coherencia de la generación {iteration + 1}: {coherence_score:.4f}")
+
+        if coherence_score > best_overall_coherence:
+            best_overall_response = response
+            best_overall_cot_steps = cot_steps
+            best_overall_coherence = coherence_score
+
+        # Actualizar el prompt para la siguiente iteración incluyendo la respuesta actual
+        prompt = f"{prompt}\nRefinamiento {iteration + 1}: {response}\n"
+
+    return best_overall_response, best_overall_cot_steps, best_overall_coherence
+
+def generate_cot(model, tokenizer, prompt, device, max_step_tokens=70, max_answer_tokens=30, temperature=0.7, top_k=50, num_steps=4, max_attempts=4, beam_width=5, top_p=0.9, repetition_penalty=1.2):
+    """
+    Genera soluciones matemáticas utilizando un enfoque de Chain of Thought (CoT).
+    Incluye generación de pasos de razonamiento intermedios y selección basada en coherencia.
     """
     model.eval()
-    
-    if not reasoning:
-        # Si decides mantener el modo general, podrías implementar aquí. Pero según tu comentario,
-        # eliminaremos este modo para simplificar el código.
-        raise NotImplementedError("El modo general ha sido eliminado. Utiliza el modo 'cot' para generación.")
-    
-    else:
-        # Generación con razonamiento paso a paso (CoT) mejorado
-        best_response = ""
-        best_cot_steps = []
-        best_coherence_score = float('-inf')
+    best_response = ""
+    best_cot_steps = []
+    best_coherence_score = float('-inf')
 
-        for attempt in range(max_attempts):
-            generated_tokens = tokenizer.encode(prompt, return_tensors="pt").to(device).long()
-            cot_steps = []
-            total_tokens = 0
+    for attempt in range(max_attempts):
+        # Tokenizar y preparar la entrada para el encoder
+        encoder_input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device).long()
+        
+        # Inicializar el decoder_input_ids con el BOS token
+        decoder_input_ids = torch.tensor([[tokenizer.bos_token_id]], device=device).long()
+        
+        cot_steps = []
+        total_tokens = 0
 
-            try:
-                # Generar pasos de Chain of Thought utilizando beam search
-                for step in range(num_steps):
-                    step_input = generated_tokens.clone()
-                    sequences = [[step_input, 0.0]]  # Empezamos con la secuencia de entrada
+        try:
+            # Generar pasos de Chain of Thought
+            for step in range(num_steps):
+                sequences = [[decoder_input_ids, 0.0]]  # Empezamos con la secuencia de entrada del decoder
 
-                    for _ in range(max_step_tokens):
-                        all_candidates = []
-                        for seq, score in sequences:
-                            if seq[0, -1].item() == tokenizer.eos_token_id:
-                                all_candidates.append((seq, score))
-                                continue
-                            with autocast(dtype=torch.float16 if device.type == 'cuda' else torch.float32):
-                                outputs = model(seq)
-                                logits = outputs[:, -1, :] / temperature
-                                logits = top_p_sampling(logits, top_p)
-                                logits = apply_repetition_penalty(logits, seq, repetition_penalty)
-                                probs = F.softmax(logits, dim=-1)
-                                topk_probs, topk_indices = torch.topk(probs, beam_width)
-
-                            for k in range(beam_width):
-                                next_token = topk_indices[k].unsqueeze(0).unsqueeze(0)
-                                next_score = score - torch.log(topk_probs[k]).item()
-                                candidate_seq = torch.cat([seq, next_token], dim=1)
-                                all_candidates.append((candidate_seq, next_score))
-
-                        # Seleccionar las mejores secuencias
-                        ordered = sorted(all_candidates, key=lambda tup: tup[1])
-                        sequences = ordered[:beam_width]
-
-                        # Verificar si todas las secuencias han generado el token EOS
-                        if all(seq[0, -1].item() == tokenizer.eos_token_id for seq, _ in sequences):
-                            break
-
-                    # Seleccionar la mejor secuencia generada para el paso actual
-                    best_seq = sequences[0][0]
-                    step_text = tokenizer.decode(best_seq[0], skip_special_tokens=True)
-
-                    if step_text.strip():
-                        cot_steps.append({
-                            "step": f"Step {step + 1}",
-                            "text": step_text,
-                        })
-                    
-                    generated_tokens = torch.cat([generated_tokens, best_seq[0][-1].unsqueeze(0).unsqueeze(0)], dim=1)
-
-                # Generar respuesta final usando beam search
-                answer_input = generated_tokens.clone()
-                sequences = [[answer_input, 0.0]]
-                for _ in range(max_answer_tokens):
+                for _ in range(max_step_tokens):
                     all_candidates = []
                     for seq, score in sequences:
                         if seq[0, -1].item() == tokenizer.eos_token_id:
                             all_candidates.append((seq, score))
                             continue
                         with autocast(dtype=torch.float16 if device.type == 'cuda' else torch.float32):
-                            outputs = model(seq)
+                            outputs = model(encoder_input_ids, seq)  # [batch_size, seq_length, vocab_size]
                             logits = outputs[:, -1, :] / temperature
                             logits = top_p_sampling(logits, top_p)
                             logits = apply_repetition_penalty(logits, seq, repetition_penalty)
                             probs = F.softmax(logits, dim=-1)
                             topk_probs, topk_indices = torch.topk(probs, beam_width)
-        
+
                         for k in range(beam_width):
-                            next_token = topk_indices[k].unsqueeze(0).unsqueeze(0)
-                            next_score = score - torch.log(topk_probs[k]).item()
-                            candidate_seq = torch.cat([seq, next_token], dim=1)
+                            next_token = topk_indices[0, k].unsqueeze(0).unsqueeze(0)  # [1, 1]
+                            next_score = score - torch.log(topk_probs[0, k]).item()
+                            candidate_seq = torch.cat([seq, next_token], dim=1)  # [1, seq_length+1]
                             all_candidates.append((candidate_seq, next_score))
 
+                    # Seleccionar las mejores secuencias
                     ordered = sorted(all_candidates, key=lambda tup: tup[1])
                     sequences = ordered[:beam_width]
 
+                    # Verificar si todas las secuencias han generado el token EOS
                     if all(seq[0, -1].item() == tokenizer.eos_token_id for seq, _ in sequences):
                         break
 
+                # Seleccionar la mejor secuencia generada para el paso actual
                 best_seq = sequences[0][0]
-                response = tokenizer.decode(best_seq[0], skip_special_tokens=True)
+                step_text = tokenizer.decode(best_seq[0], skip_special_tokens=True)
 
-                # Calcular coherencia entre la pregunta, los pasos de razonamiento y la respuesta final
-                coherence_score = calculate_coherence(prompt, [step["text"] for step in cot_steps], response)
+                if step_text.strip():
+                    cot_steps.append({
+                        "step": f"Step {step + 1}",
+                        "text": step_text,
+                    })
 
-                if coherence_score > best_coherence_score:
-                    best_response = response
-                    best_cot_steps = cot_steps
-                    best_coherence_score = coherence_score
+                decoder_input_ids = best_seq  # Actualizar el decoder_input_ids para el siguiente paso
 
-            except RuntimeError as e:
-                print(f"Error en la generación (intento {attempt + 1}): {e}")
-                continue
+            # Generar respuesta final usando beam search
+            sequences = [[decoder_input_ids, 0.0]]
+            for _ in range(max_answer_tokens):
+                all_candidates = []
+                for seq, score in sequences:
+                    if seq[0, -1].item() == tokenizer.eos_token_id:
+                        all_candidates.append((seq, score))
+                        continue
+                    with autocast(dtype=torch.float16 if device.type == 'cuda' else torch.float32):
+                        outputs = model(encoder_input_ids, seq)
+                        logits = outputs[:, -1, :] / temperature
+                        logits = top_p_sampling(logits, top_p)
+                        logits = apply_repetition_penalty(logits, seq, repetition_penalty)
+                        probs = F.softmax(logits, dim=-1)
+                        topk_probs, topk_indices = torch.topk(probs, beam_width)
 
-        if not best_response:
-            return "No se pudo generar una respuesta válida.", [], 0
-        
-        return best_response, best_cot_steps
+                for k in range(beam_width):
+                    next_token = topk_indices[0, k].unsqueeze(0).unsqueeze(0)
+                    next_score = score - torch.log(topk_probs[0, k]).item()
+                    candidate_seq = torch.cat([seq, next_token], dim=1)
+                    all_candidates.append((candidate_seq, next_score))
+
+                # Seleccionar las mejores secuencias
+                ordered = sorted(all_candidates, key=lambda tup: tup[1])
+                sequences = ordered[:beam_width]
+
+                # Verificar si todas las secuencias han generado el token EOS
+                if all(seq[0, -1].item() == tokenizer.eos_token_id for seq, _ in sequences):
+                    break
+
+            best_seq = sequences[0][0]
+            response = tokenizer.decode(best_seq[0], skip_special_tokens=True)
+
+            # Calcular coherencia entre la pregunta, los pasos de razonamiento y la respuesta final
+            coherence_score = calculate_coherence(prompt, [step["text"] for step in cot_steps], response)
+
+            if coherence_score > best_coherence_score:
+                best_response = response
+                best_cot_steps = cot_steps
+                best_coherence_score = coherence_score
+
+        except RuntimeError as e:
+            print(f"Error durante la generación (intento {attempt + 1}): {e}")
+            continue
+
+    return best_response, best_cot_steps, best_coherence_score
 
 def top_p_sampling(logits, p=0.9):
     """
@@ -437,7 +521,7 @@ def main(max_samples=1000):
     EXPERT_DIM = 256
     MAX_LENGTH = 2048
     WINDOW_SIZE = 256
-    COMPRESSION_RATIO = 0.25
+    COMPRESSION_RATIO = 0.5  # Aumentar compression_ratio a 0.5
     BATCH_SIZE = 2
     NUM_EPOCHS = 3
     ACCUMULATION_STEPS = 4
@@ -462,7 +546,7 @@ def main(max_samples=1000):
 
     # Actualizar el tamaño del embedding si se agregaron tokens especiales
     if hasattr(tokenizer, 'pad_token') and tokenizer.pad_token is not None:
-        model.embedding.token_embedding = nn.Embedding(VOCAB_SIZE, EMBED_DIM).to(device)
+        model.encoder.embedding.token_embedding = nn.Embedding(VOCAB_SIZE, EMBED_DIM).to(device)
         model.output_layer = nn.Linear(EMBED_DIM, VOCAB_SIZE).to(device)
         print("Se actualizó el tamaño del embedding para tokens especiales.")
 
@@ -470,7 +554,7 @@ def main(max_samples=1000):
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     
-    # Ajuste aquí: Inicializamos GradScaler sin argumentos incompatibles
+    # Inicializar GradScaler sin argumentos incompatibles
     scaler = GradScaler()
 
     train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, scaler, device, NUM_EPOCHS, ACCUMULATION_STEPS)
@@ -491,7 +575,7 @@ if __name__ == "__main__":
     print("Generando soluciones matemáticas con Chain of Thought:\n")
     
     for question in cot_prompts:
-        response, cot_steps, total_tokens = unified_generate(
+        response, cot_steps, coherence_score = unified_generate(
             model, tokenizer, question, device, 
             reasoning=True,
             max_step_tokens=70, 
@@ -499,10 +583,15 @@ if __name__ == "__main__":
             temperature=0.7, 
             top_k=50, 
             num_steps=4, 
-            max_attempts=4
+            max_attempts=4,
+            beam_width=5,
+            top_p=0.9,
+            repetition_penalty=1.2,
+            num_iterations=3  # Número de iteraciones para refinamiento
         )
         print(f"Pregunta:\n{question}\nRespuesta:\n{response}")
         print("Pasos de razonamiento:")
         for step in cot_steps:
             print(f"{step['step']}: {step['text']}")
-        print(f"Total de tokens generados: {total_tokens}\n{'-'*50}\n")
+        print(f"Puntuación de coherencia: {coherence_score:.4f}")
+        print(f"Total de tokens generados: {sum(len(step['text'].split()) for step in cot_steps) + len(response.split())}\n{'-'*50}\n")
