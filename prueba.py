@@ -28,19 +28,60 @@ print(f"Usando dispositivo: {device}")
 
 # Constantes globales
 EMBED_DIM = 256
+# Dimensión de embedding. Valores más altos pueden capturar más información pero aumentan la complejidad.
+# Rango recomendado: 128-512. Valores mayores pueden llevar a sobreajuste en datasets pequeños.
+
 NUM_LAYERS = 8
+# Número de capas en el codificador/decodificador. Más capas pueden capturar relaciones más complejas.
+# Rango recomendado: 4-12. Aumentar con precaución, ya que puede llevar a problemas de gradientes desvanecientes.
+
 NUM_HEADS = 8
+# Número de cabezas de atención. Permite al modelo atender a diferentes aspectos simultáneamente.
+# Rango recomendado: 4-16. Debe ser un divisor de EMBED_DIM.
+
 FF_HIDDEN_DIM = 1024
+# Dimensión oculta de la capa feed-forward. Afecta la capacidad de procesamiento no lineal.
+# Rango recomendado: 2-4 veces EMBED_DIM.
+
 NUM_EXPERTS = 4
+# Número de expertos en MoE. Más expertos pueden manejar tareas más diversas, pero aumentan la complejidad.
+# Rango recomendado: 2-8. Aumentar con cuidado, ya que puede llevar a problemas de entrenamiento.
+
 EXPERT_DIM = 256
+# Dimensión de salida de cada experto. Similar a EMBED_DIM en sus implicaciones.
+# Rango recomendado: Igual o cercano a EMBED_DIM.
+
 MAX_LENGTH = 2048
+# Longitud máxima de secuencia. Afecta directamente el uso de memoria y tiempo de procesamiento.
+# Ajustar según las necesidades específicas del dataset y recursos computacionales disponibles.
+
 WINDOW_SIZE = 256
+# Tamaño de la ventana para atención local. Balancea eficiencia y capacidad de capturar dependencias de largo alcance.
+# Rango recomendado: 128-512. Valores mayores capturan más contexto pero aumentan la complejidad.
+
 COMPRESSION_RATIO = 0.5
+# Ratio de compresión para embedding líquido. Menor valor = más compresión.
+# Rango recomendado: 0.3-0.7. Ajustar con cuidado, ya que afecta significativamente la representación de la entrada.
+
 BATCH_SIZE = 4
+# Tamaño del batch. Afecta la estabilidad del entrenamiento y el uso de memoria.
+# Ajustar según la memoria GPU disponible. Valores típicos: 4-32 para GPUs de consumo, más para GPUs de datacenter.
+
 NUM_EPOCHS = 3
+# Número de épocas de entrenamiento. Más épocas pueden mejorar el rendimiento pero aumentan el riesgo de sobreajuste.
+# Ajustar según el tamaño del dataset y monitorear la pérdida de validación para evitar sobreajuste.
+
 ACCUMULATION_STEPS = 4
-TOP_K = 2        # Número inicial de expertos a preseleccionar
-DYNAMIC_K = True # Activar el ajuste dinámico de K
+# Pasos de acumulación de gradientes. Permite simular batches más grandes en GPUs con memoria limitada.
+# Aumentar si se necesita un batch efectivo más grande pero la memoria es limitada.
+
+TOP_K = 2
+# Número inicial de expertos a preseleccionar en MoE. Afecta el balance entre especialización y generalización.
+# Rango recomendado: 1-3. Valores más altos pueden diluir la especialización de los expertos.
+
+DYNAMIC_K = True
+# Activar el ajuste dinámico de K en MoE. Permite adaptabilidad durante el entrenamiento.
+# Recomendado mantener en True para mayor flexibilidad, pero puede desactivarse para comportamiento más consistente.
 # Clase MathEvaluator
 class MathEvaluator:
     def __init__(self):
@@ -1131,8 +1172,59 @@ def main(max_samples=1000):
     monitor.remove_hooks()
 
     return model, tokenizer
-def unified_generate(model, tokenizer, prompt, device, reasoning=True, max_length=512, beam_width=5, temperature=1.0, top_p=0.9, repetition_penalty=1.2, max_step_tokens=70, max_answer_tokens=30, top_k=50, num_steps=4, max_attempts=4, num_iterations=3, evaluator=None):
-    model.to(device)
+def unified_generate(model, tokenizer, prompt, device, reasoning=True, 
+                     max_length=512, beam_width=5, temperature=1.0, 
+                     top_p=0.9, repetition_penalty=1.2, max_step_tokens=70, 
+                     max_answer_tokens=30, top_k=50, num_steps=4, 
+                     max_attempts=4, num_iterations=3, evaluator=None):
+    """
+    Genera texto utilizando el modelo entrenado.
+
+    Parámetros:
+    - max_length (int, default=512): 
+      Longitud máxima de la secuencia generada. 
+      Rango recomendado: 64-1024. Ajustar según las necesidades específicas y recursos disponibles.
+
+    - beam_width (int, default=5): 
+      Número de beams en la búsqueda de beam. Valores más altos pueden mejorar la calidad pero aumentan el tiempo de generación.
+      Rango recomendado: 1-10. Valores mayores a 5 suelen tener rendimientos decrecientes.
+
+    - temperature (float, default=1.0): 
+      Controla la aleatoriedad de la generación. Valores más bajos hacen la salida más determinista.
+      Rango recomendado: 0.5-1.5. Valores cercanos a 0 pueden llevar a repeticiones, mientras que valores muy altos pueden producir incoherencias.
+
+    - top_p (float, default=0.9): 
+      Umbral de probabilidad acumulativa para muestreo nucleico. Controla la diversidad de la salida.
+      Rango recomendado: 0.7-1.0. Valores más bajos aumentan la coherencia pero pueden limitar la creatividad.
+
+    - repetition_penalty (float, default=1.2): 
+      Penalización para la repetición de tokens. Valores más altos desalientan las repeticiones.
+      Rango recomendado: 1.0-1.5. Ajustar con cuidado, ya que valores muy altos pueden afectar la coherencia.
+
+    - max_step_tokens (int, default=70): 
+      Número máximo de tokens por paso de razonamiento.
+      Ajustar según la complejidad deseada de cada paso. Rango típico: 50-100.
+
+    - max_answer_tokens (int, default=30): 
+      Número máximo de tokens para la respuesta final.
+      Ajustar según la longitud deseada de la respuesta. Rango típico: 20-50.
+
+    - top_k (int, default=50): 
+      Número de tokens de mayor probabilidad a considerar en cada paso de generación.
+      Rango recomendado: 20-100. Valores más bajos aumentan la coherencia pero pueden limitar la diversidad.
+
+    - num_steps (int, default=4): 
+      Número de pasos de razonamiento.
+      Ajustar según la complejidad del problema. Rango típico: 2-6.
+
+    - max_attempts (int, default=4): 
+      Número máximo de intentos de generación.
+      Aumentar si se encuentran frecuentes fallos de generación. Rango típico: 1-5.
+
+    - num_iterations (int, default=3): 
+      Número de iteraciones de refinamiento.
+      Más iteraciones pueden mejorar la calidad pero aumentan el tiempo de generación. Rango típico: 1-5.
+    """    
     model.eval()
 
     best_overall_response = ""
@@ -1445,40 +1537,68 @@ def analyze_token_transformations(model, tokenizer, prompt):
     print("\nAnálisis de transformación de tokens completado.")
 
 if __name__ == "__main__":
-    model, tokenizer = main(max_samples=10000)
+    # Número máximo de muestras a utilizar para el entrenamiento
+    # Implicaciones: Controla el tamaño del dataset de entrenamiento
+    # Ajuste: Aumentar para mejorar el rendimiento, pero también aumenta el tiempo de entrenamiento y los requisitos de memoria
+    # Rango recomendado: 1000-100000, dependiendo de los recursos disponibles
+    max_samples = 10000
+    model, tokenizer = main(max_samples=max_samples)
+
+    # Selección del dispositivo (GPU si está disponible, CPU en caso contrario)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # Cálculo del número total de parámetros del modelo
+    # Útil para estimar la complejidad del modelo y los requisitos de memoria
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model.to(device)
     print(f"Total parameters: {total_params}")
-        # Ejemplo de uso
+
+    # Ejemplo de prompt para análisis de transformaciones de tokens
+    # Puede modificarse para analizar diferentes tipos de entradas
     prompt = "Resuelve la siguiente ecuación: 2x + 5 = 15"
     analyze_token_transformations(model, tokenizer, prompt)
+
+    # Lista de prompts para generar soluciones matemáticas
+    # Puede expandirse o modificarse para probar diferentes tipos de problemas
     cot_prompts = [
         "Instrucción: Resuelve el siguiente problema matemático.\nEntrada: Si una bicicleta cuesta $120 y pago con un billete de $200, ¿cuánto cambio recibiré?\nRazonamiento:",
         "Instrucción: Explica el teorema de Pitágoras.\nEntrada: \nRazonamiento:",
     ]
 
+    # Inicialización del evaluador matemático
     evaluator = MathEvaluator()
 
     print("Generando soluciones matemáticas con Chain of Thought:\n")
     
     for question in cot_prompts:
+        # Generación de respuestas utilizando el modelo
         response, cot_steps, coherence_score = unified_generate(
             model, tokenizer, question, device, 
             reasoning=True,
-            max_step_tokens=70, 
-            max_answer_tokens=30, 
-            temperature=0.7, 
-            top_k=50, 
-            num_steps=3, 
-            max_attempts=4,
-            beam_width=5,
-            top_p=0.9,
-            repetition_penalty=0.8,
-            num_iterations=2,
+            max_step_tokens=70,  # Máximo número de tokens por paso de razonamiento
+                                 # Ajuste: 50-100, dependiendo de la complejidad deseada de cada paso
+            max_answer_tokens=30,  # Máximo número de tokens para la respuesta final
+                                   # Ajuste: 20-50, según la longitud deseada de la respuesta
+            temperature=0.7,  # Controla la aleatoriedad de la generación
+                              # Ajuste: 0.5-1.0, valores más bajos para respuestas más deterministas
+            top_k=50,  # Número de tokens más probables a considerar en cada paso
+                       # Ajuste: 20-100, valores más bajos para mayor coherencia
+            num_steps=3,  # Número de pasos de razonamiento
+                          # Ajuste: 2-5, según la complejidad del problema
+            max_attempts=4,  # Número máximo de intentos de generación
+                             # Ajuste: 1-5, aumentar si hay fallos frecuentes
+            beam_width=5,  # Número de beams en la búsqueda de beam
+                           # Ajuste: 1-10, valores más altos para potencialmente mejor calidad
+            top_p=0.9,  # Umbral de probabilidad acumulativa para muestreo nucleico
+                        # Ajuste: 0.7-1.0, valores más bajos para mayor coherencia
+            repetition_penalty=0.8,  # Penalización para la repetición de tokens
+                                     # Ajuste: 0.8-1.2, valores más altos para desalentar repeticiones
+            num_iterations=2,  # Número de iteraciones de refinamiento
+                               # Ajuste: 1-5, más iteraciones pueden mejorar la calidad pero aumentan el tiempo
             evaluator=evaluator
         )
+
+        # Impresión de resultados
         print(f"Pregunta:\n{question}\nRespuesta:\n{response}")
         print("Pasos de razonamiento:")
         for step in cot_steps:
