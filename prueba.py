@@ -233,14 +233,32 @@ class ActivationMonitor:
     def remove_hooks(self):
         for handle in self.handles:
             handle.remove()
-
 class MoELayer(nn.Module):
+    """
+    Implementa una capa de Mixture of Experts (MoE) que permite el enrutamiento dinámico de la entrada a múltiples expertos.
+    """
     def __init__(self, input_dim, hidden_dim, num_experts, expert_dim, dropout=0.1, entropy_weight=0.1, top_k=2, dynamic_k=False, max_usage_ratio=0.3):
+        """
+        Inicializa la capa MoE.
+
+        Args:
+            input_dim (int): Dimensión de entrada.
+            hidden_dim (int): Dimensión oculta de los expertos.
+            num_experts (int): Número total de expertos.
+            expert_dim (int): Dimensión de salida de cada experto.
+            dropout (float): Tasa de dropout.
+            entropy_weight (float): Peso para la regularización de entropía.
+            top_k (int): Número inicial de expertos a seleccionar.
+            dynamic_k (bool): Si se debe ajustar dinámicamente el número de expertos.
+            max_usage_ratio (float): Ratio máximo de uso permitido para cada experto.
+        """
         super(MoELayer, self).__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.dynamic_k = dynamic_k
+        # Lista de expertos (cada uno es una capa lineal)
         self.experts = nn.ModuleList([nn.Linear(input_dim, hidden_dim) for _ in range(num_experts)])
+        # Capa de enrutamiento (gate)
         self.gate = nn.Linear(input_dim, num_experts)
         self.dropout = nn.Dropout(dropout)
         self.entropy_weight = entropy_weight
@@ -248,9 +266,19 @@ class MoELayer(nn.Module):
         self.expert_usage_counter = None
 
     def forward(self, x):
+        """
+        Realiza la pasada hacia adelante de la capa MoE.
+
+        Args:
+            x (Tensor): Tensor de entrada de forma [batch_size, seq_length, input_dim].
+
+        Returns:
+            Tuple[Tensor, Tensor]: Salida procesada y pérdida combinada (entropía + penalización por uso excesivo).
+        """
         batch_size, seq_length, input_dim = x.size()
         x_flat = x.view(-1, input_dim)
         
+        # Calcular probabilidades de enrutamiento
         gate_logits = self.gate(x_flat)
         gate_probs = F.softmax(gate_logits, dim=-1)
 
@@ -258,20 +286,23 @@ class MoELayer(nn.Module):
         entropy = -torch.sum(gate_probs * torch.log(gate_probs + 1e-10), dim=-1).mean()
         entropy_loss = self.entropy_weight * entropy
 
-        # Ajuste dinámico de K
+        # Ajuste dinámico de K (número de expertos a seleccionar)
         if self.dynamic_k:
             complexity = entropy.detach().item()
             K = max(1, min(self.num_experts, int(self.top_k * (1 + complexity))))
         else:
             K = self.top_k
 
+        # Seleccionar los top-K expertos
         topk_probs, topk_indices = torch.topk(gate_probs, K, dim=-1)
 
         # Inicializar o reiniciar el contador de uso de expertos
         self.expert_usage_counter = torch.zeros(self.num_experts, device=x.device)
 
+        # Preparar el tensor de salida
         expert_outputs = torch.zeros(batch_size * seq_length, self.experts[0].out_features, device=x.device)
 
+        # Procesar la entrada con los expertos seleccionados
         for k in range(K):
             expert_idx = topk_indices[:, k]
             mask = torch.arange(x_flat.size(0), device=x.device).unsqueeze(1) == expert_idx.unsqueeze(1)
@@ -290,20 +321,27 @@ class MoELayer(nn.Module):
         usage_ratios = self.expert_usage_counter / (batch_size * seq_length)
         overuse_penalty = torch.sum(F.relu(usage_ratios - self.max_usage_ratio))
 
+        # Reformatear la salida
         output = expert_outputs.view(batch_size, seq_length, -1)
 
         return output, entropy_loss + overuse_penalty
 
     def get_expert_usage_stats(self):
+        """
+        Obtiene estadísticas de uso de los expertos.
+
+        Returns:
+            List[float] or None: Porcentajes de uso de cada experto, o None si no hay datos disponibles.
+        """
         if self.expert_usage_counter is None:
             return None
         total_usage = self.expert_usage_counter.sum().item()
         usage_percentages = (self.expert_usage_counter / total_usage * 100).tolist()
         return usage_percentages
-
-
-
 class LiquidEmbedding(nn.Module):
+    """
+    Implementa un embedding 'líquido' que adapta dinámicamente la compresión basada en la complejidad de la entrada.
+    """
     def __init__(self, vocab_size, embed_dim, max_length=2048, base_compression_ratio=0.5, min_compression_ratio=0.1):
         """
         Inicializa el módulo LiquidEmbedding.
@@ -319,11 +357,16 @@ class LiquidEmbedding(nn.Module):
         self.embed_dim = embed_dim
         self.base_compression_ratio = base_compression_ratio
         self.min_compression_ratio = min_compression_ratio
+        # Capa de embedding para tokens
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        # Capa de embedding para posiciones
         self.position_embedding = nn.Embedding(max_length, embed_dim)
+        # Capas convolucionales para procesar los embeddings
         self.conv1 = nn.Conv1d(in_channels=embed_dim, out_channels=embed_dim, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(in_channels=embed_dim, out_channels=embed_dim, kernel_size=3, padding=1)
+        # Capa de proyección final
         self.proj = nn.Linear(embed_dim, embed_dim)
+        # Función de pérdida para la reconstrucción
         self.reconstruction_loss_fn = nn.MSELoss()
 
     def forward(self, x):
@@ -353,20 +396,20 @@ class LiquidEmbedding(nn.Module):
         x = x.permute(0, 2, 1)
         x = x.to(torch.float32)
 
-        # Aplicar FFT
+        # Aplicar FFT para análisis de frecuencia
         x_fft = torch.fft.fft(x, dim=1)
 
-        # Calcular la complejidad de la secuencia
+        # Calcular la complejidad de la secuencia basada en la magnitud de las frecuencias
         magnitude = torch.abs(x_fft)
         complexity = (magnitude > 0.1 * magnitude.max(dim=1, keepdim=True).values).float().mean(dim=(1, 2))
         
-        # Calcular el ratio de compresión dinámico
+        # Calcular el ratio de compresión dinámico basado en la complejidad
         dynamic_compression_ratio = self.base_compression_ratio * (1 - complexity)
-        dynamic_compression_ratio = torch.clamp(dynamic_compression_ratio, min=self.min_compression_ratio, max=1.0)  # Añadido max=1.0
+        dynamic_compression_ratio = torch.clamp(dynamic_compression_ratio, min=self.min_compression_ratio, max=1.0)
 
         # Calcular N para cada muestra en el batch
         N = (dynamic_compression_ratio * seq_length).long()
-        N = torch.clamp(N, min=1, max=seq_length)  # Asegurar que N no sea mayor que seq_length
+        N = torch.clamp(N, min=1, max=seq_length)
 
         max_N = N.max().item()
 
@@ -391,12 +434,25 @@ class LiquidEmbedding(nn.Module):
         mask_expanded = mask.unsqueeze(-1).expand_as(x_ifft)
         
         # Calcular la pérdida de reconstrucción usando la máscara
-        diff = (x_ifft - recon_target).abs() * mask_expanded.float()  # Multiplicar por la máscara
-        loss_recon = diff.sum() / mask_expanded.sum() if mask_expanded.sum() > 0 else torch.tensor(0.0, device=x.device) # Calcular la media enmascarada
+        diff = (x_ifft - recon_target).abs() * mask_expanded.float()
+        loss_recon = diff.sum() / mask_expanded.sum() if mask_expanded.sum() > 0 else torch.tensor(0.0, device=x.device)
 
         return x_ifft, loss_recon
 class EnhancedLocalAttention(nn.Module):
+    """
+    Implementa un mecanismo de atención local mejorado con ventanas superpuestas opcionales.
+    """
     def __init__(self, embed_dim, num_heads, window_size=256, bidirectional=True, dropout=0.1):
+        """
+        Inicializa el módulo EnhancedLocalAttention.
+
+        Args:
+            embed_dim (int): Dimensión de los embeddings.
+            num_heads (int): Número de cabezas de atención.
+            window_size (int): Tamaño de la ventana de atención local.
+            bidirectional (bool): Si se usa atención bidireccional o no.
+            dropout (float): Tasa de dropout.
+        """
         super(EnhancedLocalAttention, self).__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -404,20 +460,35 @@ class EnhancedLocalAttention(nn.Module):
         self.bidirectional = bidirectional
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        # Capa lineal para generar queries, keys y values
         self.qkv = nn.Linear(embed_dim, embed_dim * 3)
+        # Capa de salida
         self.out = nn.Linear(embed_dim, embed_dim)
+        # Capa de dropout
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
+        """
+        Realiza la pasada hacia adelante del módulo EnhancedLocalAttention.
+
+        Args:
+            x (Tensor): Tensor de entrada de forma [batch_size, seq_length, embed_dim].
+
+        Returns:
+            Tensor: Salida procesada por la atención local.
+        """
         B, L, C = x.shape
+        # Padding para asegurar que la longitud de la secuencia es múltiplo del tamaño de la ventana
         pad_l = (self.window_size - L % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, 0, pad_l))
         _, L_padded, _ = x.shape
         
+        # Generar queries, keys y values
         qkv = self.qkv(x).reshape(B, L_padded, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
         if self.bidirectional:
+            # Atención bidireccional con ventanas superpuestas
             overlapping_size = self.window_size // 2
             step = overlapping_size
             window_size = self.window_size
@@ -425,29 +496,71 @@ class EnhancedLocalAttention(nn.Module):
             k = k.unfold(2, window_size, step).contiguous()
             v = v.unfold(2, window_size, step).contiguous()
         else:
+            # Atención unidireccional con ventanas no superpuestas
             q = q.unfold(2, self.window_size, self.window_size).contiguous()
             k = k.unfold(2, self.window_size, self.window_size).contiguous()
             v = v.unfold(2, self.window_size, self.window_size).contiguous()
         
+        # Calcular puntajes de atención y aplicar softmax
         attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
         attn = F.softmax(attn, dim=-1)
         
+        # Aplicar atención a los values y reorganizar
         x = (attn @ v).reshape(B, self.num_heads, -1, self.head_dim).permute(0, 2, 1, 3).reshape(B, -1, C)
         x = self.out(x)
         x = self.dropout(x)
         
+        # Devolver la salida sin el padding adicional
         return x[:, :L]
-
 class DilatedConvolution(nn.Module):
+    """
+    Implementa una capa de convolución dilatada para capturar dependencias de largo alcance.
+    """
     def __init__(self, channels, kernel_size, dilation):
+        """
+        Inicializa el módulo DilatedConvolution.
+
+        Args:
+            channels (int): Número de canales de entrada y salida.
+            kernel_size (int): Tamaño del kernel de convolución.
+            dilation (int): Factor de dilatación.
+        """
         super(DilatedConvolution, self).__init__()
         self.conv = nn.Conv1d(channels, channels, kernel_size, padding='same', dilation=dilation)
         
     def forward(self, x):
+        """
+        Realiza la pasada hacia adelante del módulo DilatedConvolution.
+
+        Args:
+            x (Tensor): Tensor de entrada de forma [batch_size, seq_length, channels].
+
+        Returns:
+            Tensor: Salida procesada por la convolución dilatada.
+        """
+        # Transponer para aplicar la convolución y luego volver a transponer
         return self.conv(x.transpose(1, 2)).transpose(1, 2)
-# Clase ImprovedTransformerBlock actualizada para utilizar la nueva MoELayer
 class ImprovedTransformerBlock(nn.Module):
+    """
+    Implementa un bloque de transformador mejorado con atención local, convolución dilatada y MoE.
+    """
     def __init__(self, embed_dim, num_heads, ff_hidden_dim, num_experts, expert_dim, window_size=256, bidirectional=True, dropout=0.12, entropy_weight=0.1, top_k=2, dynamic_k=False):
+        """
+        Inicializa el módulo ImprovedTransformerBlock.
+
+        Args:
+            embed_dim (int): Dimensión de los embeddings.
+            num_heads (int): Número de cabezas de atención.
+            ff_hidden_dim (int): Dimensión oculta de la capa feed-forward.
+            num_experts (int): Número de expertos en la capa MoE.
+            expert_dim (int): Dimensión de salida de cada experto.
+            window_size (int): Tamaño de la ventana para la atención local.
+            bidirectional (bool): Si se usa atención bidireccional.
+            dropout (float): Tasa de dropout.
+            entropy_weight (float): Peso para la regularización de entropía en MoE.
+            top_k (int): Número de expertos a seleccionar en MoE.
+            dynamic_k (bool): Si se ajusta dinámicamente el número de expertos.
+        """
         super(ImprovedTransformerBlock, self).__init__()
         self.attention = EnhancedLocalAttention(embed_dim, num_heads, window_size, bidirectional)
         self.norm1 = nn.LayerNorm(embed_dim)
@@ -475,19 +588,34 @@ class ImprovedTransformerBlock(nn.Module):
         )
         
     def forward(self, x):
+        """
+        Realiza la pasada hacia adelante del módulo ImprovedTransformerBlock.
+
+        Args:
+            x (Tensor): Tensor de entrada.
+
+        Returns:
+            Tuple[Tensor, Tensor]: Salida procesada y pérdida de entropía.
+        """
+        # Aplicar atención local y residual
         x = x + self.dropout1(self.attention(self.norm1(x)))
+        # Aplicar convolución dilatada y residual
         x = x + self.dropout2(self.dilated_conv(self.norm2(x)))
+        # Aplicar MoE y residual
         moe_output, entropy_loss = self.moe(self.norm3(x))
         x = x + self.dropout3(moe_output)
+        # Aplicar capa feed-forward y residual
         x = x + self.ff_layer(x)
         return x, entropy_loss
-
-
-# Clase BidirectionalEncoder actualizada para pasar top_k y dynamic_k a los bloques
 class BidirectionalEncoder(nn.Module):
+    """
+    Implementa un codificador bidireccional con múltiples capas de transformador mejorado.
+    """
     def __init__(self, vocab_size, embed_dim, max_length=2048, compression_ratio=0.5, num_layers=4, num_heads=8, ff_hidden_dim=1024, window_size=256, num_experts=2, expert_dim=256, entropy_weight=0.1, top_k=2, dynamic_k=False):
         super(BidirectionalEncoder, self).__init__()
+        # Capa de embedding líquido
         self.embedding = LiquidEmbedding(vocab_size, embed_dim, max_length, base_compression_ratio=compression_ratio)
+        # Lista de capas de transformador mejorado
         self.layers = nn.ModuleList([
             ImprovedTransformerBlock(
                 embed_dim=embed_dim, 
@@ -504,23 +632,58 @@ class BidirectionalEncoder(nn.Module):
             )
             for _ in range(num_layers)
         ])
+        # Normalización final
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
+        """
+        Realiza la pasada hacia adelante del codificador bidireccional.
+
+        Args:
+            x (Tensor): Tensor de entrada de forma [batch_size, seq_length].
+
+        Returns:
+            Tuple[Tensor, Tensor, Tensor]: Salida procesada, pérdida de reconstrucción y pérdida de entropía total.
+        """
+        # Aplicar embedding líquido
         x, recon_loss = self.embedding(x)
         total_entropy_loss = 0
+        # Pasar por cada capa de transformador
         for layer in self.layers:
             x, entropy_loss = layer(x)
             total_entropy_loss += entropy_loss
+        # Normalización final
         x = self.layer_norm(x)
         return x, recon_loss, total_entropy_loss
-
-
-# Clase LiquidFoundationModelOptimized actualizada para pasar top_k y dynamic_k al encoder y decoder
 class LiquidFoundationModelOptimized(nn.Module):
+    """
+    Implementa un modelo de fundación 'líquido' optimizado que combina un codificador bidireccional
+    y un decodificador con capas de transformador mejoradas y embedding líquido.
+    """
     def __init__(self, vocab_size, embed_dim=256, num_layers=4, num_heads=8, ff_hidden_dim=1024,
-                 num_experts=4, expert_dim=256, max_length=2048, window_size=256, compression_ratio=0.5, entropy_weight=0.1, top_k=2, dynamic_k=False):
+                 num_experts=4, expert_dim=256, max_length=2048, window_size=256, compression_ratio=0.5, 
+                 entropy_weight=0.1, top_k=2, dynamic_k=False):
+        """
+        Inicializa el modelo LiquidFoundationModelOptimized.
+
+        Args:
+            vocab_size (int): Tamaño del vocabulario.
+            embed_dim (int): Dimensión de los embeddings.
+            num_layers (int): Número de capas en el codificador y decodificador.
+            num_heads (int): Número de cabezas de atención en cada capa.
+            ff_hidden_dim (int): Dimensión oculta de la capa feed-forward.
+            num_experts (int): Número de expertos en la capa MoE.
+            expert_dim (int): Dimensión de salida de cada experto.
+            max_length (int): Longitud máxima de la secuencia.
+            window_size (int): Tamaño de la ventana para la atención local.
+            compression_ratio (float): Ratio de compresión para el embedding líquido.
+            entropy_weight (float): Peso para la regularización de entropía en MoE.
+            top_k (int): Número inicial de expertos a seleccionar en MoE.
+            dynamic_k (bool): Si se ajusta dinámicamente el número de expertos en MoE.
+        """
         super(LiquidFoundationModelOptimized, self).__init__()
+        
+        # Inicializar el codificador bidireccional
         self.encoder = BidirectionalEncoder(
             vocab_size=vocab_size,
             embed_dim=embed_dim,
@@ -536,6 +699,8 @@ class LiquidFoundationModelOptimized(nn.Module):
             top_k=top_k,
             dynamic_k=dynamic_k
         )
+        
+        # Inicializar el embedding líquido para el decodificador
         self.decoder_embedding = LiquidEmbedding(
             vocab_size, 
             embed_dim, 
@@ -543,6 +708,8 @@ class LiquidFoundationModelOptimized(nn.Module):
             base_compression_ratio=0.5, 
             min_compression_ratio=0.1
         )
+        
+        # Inicializar las capas del decodificador
         self.decoder_layers = nn.ModuleList([
             ImprovedTransformerBlock(
                 embed_dim=embed_dim, 
@@ -551,7 +718,7 @@ class LiquidFoundationModelOptimized(nn.Module):
                 num_experts=num_experts, 
                 expert_dim=expert_dim, 
                 window_size=window_size, 
-                bidirectional=False, 
+                bidirectional=False,  # El decodificador es unidireccional
                 dropout=0.12, 
                 entropy_weight=entropy_weight, 
                 top_k=top_k, 
@@ -559,23 +726,52 @@ class LiquidFoundationModelOptimized(nn.Module):
             )
             for _ in range(num_layers)
         ])
+        
+        # Capa de normalización final
         self.layer_norm = nn.LayerNorm(embed_dim)
+        
+        # Capa de salida para generar logits sobre el vocabulario
         self.output_layer = nn.Linear(embed_dim, vocab_size)
+        
         self.max_length = max_length
         self.compression_ratio = compression_ratio
 
     def forward(self, encoder_input_ids, decoder_input_ids):
+        """
+        Realiza la pasada hacia adelante del modelo.
+
+        Args:
+            encoder_input_ids (Tensor): IDs de entrada para el codificador.
+            decoder_input_ids (Tensor): IDs de entrada para el decodificador.
+
+        Returns:
+            Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: 
+                - Logits de salida
+                - Pérdida de reconstrucción del codificador
+                - Pérdida de reconstrucción del decodificador
+                - Pérdida de entropía del codificador
+                - Pérdida de entropía total del decodificador
+        """
+        # Procesar la entrada a través del codificador
         encoder_output, recon_loss_enc, entropy_loss_enc = self.encoder(encoder_input_ids)
+        
+        # Aplicar embedding líquido a la entrada del decodificador
         decoder_embeddings, recon_loss_dec = self.decoder_embedding(decoder_input_ids)
+        
         total_entropy_loss_dec = 0
+        # Pasar por cada capa del decodificador
         for layer in self.decoder_layers:
             decoder_embeddings, entropy_loss = layer(decoder_embeddings)
             total_entropy_loss_dec += entropy_loss
+        
+        # Aplicar normalización final
         decoder_embeddings = self.layer_norm(decoder_embeddings)
+        
+        # Generar logits de salida
         logits = self.output_layer(decoder_embeddings)
-        return logits[:, :2048, :], recon_loss_enc, recon_loss_dec, entropy_loss_enc, total_entropy_loss_dec
-
-
+        
+        # Limitar la salida a max_length
+        return logits[:, :self.max_length, :], recon_loss_enc, recon_loss_dec, entropy_loss_enc, total_entropy_loss_dec
 # Funciones auxiliares
 def prepare_data(max_samples=None, val_size=0.1):
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
