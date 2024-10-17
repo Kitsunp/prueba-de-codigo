@@ -18,226 +18,97 @@ import math
 import os
 from nltk.tokenize import word_tokenize
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-import sympy
-from sklearn.metrics.pairwise import cosine_similarity
 from rouge_score import rouge_scorer
+from sklearn.metrics import f1_score, precision_score, recall_score
+from nltk.tokenize import word_tokenize
+from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+import hashlib
+from torch.utils.checkpoint import checkpoint
 
 # Configuración global
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Usando dispositivo: {device}")
 
 # Constantes globales
-EMBED_DIM = 256
-# Dimensión de embedding. Valores más altos pueden capturar más información pero aumentan la complejidad.
-# Rango recomendado: 128-512. Valores mayores pueden llevar a sobreajuste en datasets pequeños.
-
-NUM_LAYERS = 8
-# Número de capas en el codificador/decodificador. Más capas pueden capturar relaciones más complejas.
-# Rango recomendado: 4-12. Aumentar con precaución, ya que puede llevar a problemas de gradientes desvanecientes.
-
+EMBED_DIM = 512
+NUM_LAYERS = 12
 NUM_HEADS = 8
-# Número de cabezas de atención. Permite al modelo atender a diferentes aspectos simultáneamente.
-# Rango recomendado: 4-16. Debe ser un divisor de EMBED_DIM.
-
 FF_HIDDEN_DIM = 1024
-# Dimensión oculta de la capa feed-forward. Afecta la capacidad de procesamiento no lineal.
-# Rango recomendado: 2-4 veces EMBED_DIM.
-
-NUM_EXPERTS = 4
-# Número de expertos en MoE. Más expertos pueden manejar tareas más diversas, pero aumentan la complejidad.
-# Rango recomendado: 2-8. Aumentar con cuidado, ya que puede llevar a problemas de entrenamiento.
-
-EXPERT_DIM = 256
-# Dimensión de salida de cada experto. Similar a EMBED_DIM en sus implicaciones.
-# Rango recomendado: Igual o cercano a EMBED_DIM.
-
-MAX_LENGTH = 2048
-# Longitud máxima de secuencia. Afecta directamente el uso de memoria y tiempo de procesamiento.
-# Ajustar según las necesidades específicas del dataset y recursos computacionales disponibles.
-
-WINDOW_SIZE = 256
-# Tamaño de la ventana para atención local. Balancea eficiencia y capacidad de capturar dependencias de largo alcance.
-# Rango recomendado: 128-512. Valores mayores capturan más contexto pero aumentan la complejidad.
-
+NUM_EXPERTS = 8
+EXPERT_DIM = 512
+MAX_LENGTH = 8192
+WINDOW_SIZE = 2048
 COMPRESSION_RATIO = 0.5
-# Ratio de compresión para embedding líquido. Menor valor = más compresión.
-# Rango recomendado: 0.3-0.7. Ajustar con cuidado, ya que afecta significativamente la representación de la entrada.
-
 BATCH_SIZE = 4
-# Tamaño del batch. Afecta la estabilidad del entrenamiento y el uso de memoria.
-# Ajustar según la memoria GPU disponible. Valores típicos: 4-32 para GPUs de consumo, más para GPUs de datacenter.
+NUM_EPOCHS = 6
+ACCUMULATION_STEPS = 6
+TOP_K = 4       # Número inicial de expertos a preseleccionar
+DYNAMIC_K = True # Activar el ajuste dinámico de K
 
-NUM_EPOCHS = 3
-# Número de épocas de entrenamiento. Más épocas pueden mejorar el rendimiento pero aumentan el riesgo de sobreajuste.
-# Ajustar según el tamaño del dataset y monitorear la pérdida de validación para evitar sobreajuste.
+# Clases y Funciones
 
-ACCUMULATION_STEPS = 4
-# Pasos de acumulación de gradientes. Permite simular batches más grandes en GPUs con memoria limitada.
-# Aumentar si se necesita un batch efectivo más grande pero la memoria es limitada.
-
-TOP_K = 2
-# Número inicial de expertos a preseleccionar en MoE. Afecta el balance entre especialización y generalización.
-# Rango recomendado: 1-3. Valores más altos pueden diluir la especialización de los expertos.
-
-DYNAMIC_K = True
-# Activar el ajuste dinámico de K en MoE. Permite adaptabilidad durante el entrenamiento.
-# Recomendado mantener en True para mayor flexibilidad, pero puede desactivarse para comportamiento más consistente.
-# Clase MathEvaluator
-class MathEvaluator:
+class TextEvaluator:
     def __init__(self):
-        self.math_lm = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased").to(device)
-        self.math_tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        self.scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        self.smoothing = SmoothingFunction()
+
+    def calculate_metrics(self, questions, answers, labels):
+        bleu_scores = []
+        rouge_scores = {'rouge1': [], 'rouge2': [], 'rougeL': []}
+        f1_scores_list = []
         
-    def evaluate_coherence(self, question, cot_steps, response):
-        full_text = question + " ".join([step["text"] for step in cot_steps]) + response
+        # Asegurarse de que todas las listas tengan la misma longitud
+        min_length = min(len(questions), len(answers), len(labels))
+        questions = questions[:min_length]
+        answers = answers[:min_length]
+        labels = labels[:min_length]
         
-        math_elements = re.findall(r'\d+|[\+\-\*/\^]', full_text)
-        math_score = len(math_elements) / len(full_text.split()) if full_text.split() else 0
+        for q, a, l in zip(questions, answers, labels):
+            # Tokenización consistente
+            a_tokens = word_tokenize(a.lower())
+            l_tokens = word_tokenize(l.lower())
+            
+            # BLEU
+            bleu = sentence_bleu([l_tokens], a_tokens, smoothing_function=self.smoothing.method1)
+            bleu_scores.append(bleu)
+            
+            # ROUGE
+            rouge_result = self.scorer.score(l, a)
+            rouge_scores['rouge1'].append(rouge_result['rouge1'].fmeasure)
+            rouge_scores['rouge2'].append(rouge_result['rouge2'].fmeasure)
+            rouge_scores['rougeL'].append(rouge_result['rougeL'].fmeasure)
+            
+            # F1 (usando conjuntos para manejar longitudes diferentes)
+            f1 = f1_score(
+                [1 if token in l_tokens else 0 for token in set(a_tokens + l_tokens)],
+                [1 if token in a_tokens else 0 for token in set(a_tokens + l_tokens)],
+                average='binary',
+                zero_division=1
+            )
+            f1_scores_list.append(f1)
         
-        step_scores = [len(step["text"].split()) for step in cot_steps]
-        step_score = sum(step_scores) / len(step_scores) if step_scores else 0
-        
-        response_score = 1 if response.strip().isdigit() else 0
-        
-        coherence_score = (math_score + step_score + response_score) / 3
-        
-        return coherence_score
-
-    def evaluate_math_precision(self, expected, generated):
-        try:
-            expected_expr = sympy.sympify(expected)
-            generated_expr = sympy.sympify(generated)
-            return sympy.simplify(expected_expr - generated_expr) == 0
-        except:
-            return False
-
-    def evaluate_step_relevance(self, question, steps):
-        if not steps:
-            return 0.0
-        
-        question_embedding = torch.tensor(self.get_embedding(question)).to(device)  # Shape: [embed_dim]
-        step_embeddings = torch.tensor([self.get_embedding(step["text"]) for step in steps]).to(device)  # Shape: [num_steps, embed_dim]
-        
-        # Normalizar embeddings
-        question_norm = question_embedding / question_embedding.norm(dim=-1, keepdim=True)
-        step_norms = step_embeddings / step_embeddings.norm(dim=-1, keepdim=True)
-        
-        # Calcular similitud de coseno en batch
-        similarities = torch.mm(step_norms, question_norm.unsqueeze(-1)).squeeze(-1)  # Shape: [num_steps]
-        
-        return similarities.mean().item()
-
-
-    def evaluate_reasoning_complexity(self, steps):
-        total_operations = sum(len(re.findall(r'[\+\-\*/\^]', step["text"])) for step in steps)
-        return total_operations / len(steps) if steps else 0
-
-    def evaluate_numerical_consistency(self, steps, answer):
-        # Extraer todos los números de una sola pasada
-        numbers = re.findall(r'\d+', ' '.join([step["text"] for step in steps]) + ' ' + answer)
-        unique_numbers = set(numbers)
-        return len(unique_numbers) / len(numbers) if numbers else 1.0
-
-
-    def evaluate_concept_coverage(self, question, answer):
-        question_concepts = set(re.findall(r'\b\w+\b', question.lower()))
-        answer_concepts = set(re.findall(r'\b\w+\b', answer.lower()))
-        return len(question_concepts.intersection(answer_concepts)) / len(question_concepts) if question_concepts else 0
-
-    def evaluate_explainability(self, question, steps, answer):
-        full_explanation = " ".join([step["text"] for step in steps]) + " " + answer
-        question_words = set(word_tokenize(question.lower()))
-        explanation_words = set(word_tokenize(full_explanation.lower()))
-        return len(question_words.intersection(explanation_words)) / len(question_words) if question_words else 0
-
-    def evaluate_solution_efficiency(self, question, steps):
-        ideal_steps = self.estimate_ideal_steps(question)
-        return max(0, 1 - abs(ideal_steps - len(steps)) / ideal_steps)
-
-    def evaluate_reasoning_adaptability(self, questions, answers):
-        complexities = [self.calculate_problem_complexity(q) for q in questions]
-        answer_qualities = [self.evaluate_answer_quality(q, a) for q, a in zip(questions, answers)]
-        return np.mean([q / c for q, c in zip(answer_qualities, complexities) if c != 0])
-
-    def evaluate_f1_score(self, pred_text, label_text, tolerance=1e-6, with_steps=False):
-        if with_steps:
-            pred_steps = self.extract_step_numbers(pred_text)
-            label_steps = self.extract_step_numbers(label_text)
-            return np.mean([self.calculate_f1(str(p), str(l), tolerance) for p, l in zip(pred_steps, label_steps)])
-        else:
-            return self.calculate_f1(pred_text, label_text, tolerance)
-
-    def calculate_f1(self, pred_text, label_text, tolerance):
-        pred_nums = torch.tensor(self.extract_numbers(pred_text), dtype=torch.float32, device=device)
-        label_nums = torch.tensor(self.extract_numbers(label_text), dtype=torch.float32, device=device)
-
-        if not pred_nums.numel() or not label_nums.numel():
-            return 0.0
-
-        # Calcular diferencias absolutas en GPU
-        diffs = torch.abs(pred_nums.unsqueeze(1) - label_nums)
-        true_positives = (diffs <= tolerance).any(dim=1).sum().item()
-
-        precision = true_positives / pred_nums.numel() if pred_nums.numel() else 0
-        recall = true_positives / label_nums.numel() if label_nums.numel() else 0
-
-        return 2 * (precision * recall) / (precision + recall) if precision + recall > 0 else 0.0
-    def evaluate_f1_with_complexity(self, pred_text, label_text):
-        complexity = self.calculate_problem_complexity(label_text)
-        base_f1 = self.evaluate_f1_score(pred_text, label_text)
-        return base_f1 * (1 - 1 / (np.log(complexity + 1) + 1))
-
-    def evaluate_f1_with_explanation(self, pred_text, label_text):
-        numeric_f1 = self.evaluate_f1_score(pred_text, label_text)
-        
-        pred_words = pred_text.lower().split()
-        label_words = label_text.lower().split()
-        bleu_score = sentence_bleu([label_words], pred_words)
-        
-        return (numeric_f1 + bleu_score) / 2
-
-    def get_embedding(self, text):
-        inputs = self.math_tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
-        with torch.no_grad():
-            outputs = self.math_lm(**inputs)
-        return outputs.logits  # Retorna tensor en GPU
-    def estimate_ideal_steps(self, question):
-        return max(2, min(5, self.calculate_problem_complexity(question)))
-
-    def calculate_problem_complexity(self, text):
-        operations = re.findall(r'[\+\-\*/\^]', text)
-        return len(operations) + 1
-
-    def evaluate_answer_quality(self, question, answer):
-        return self.evaluate_concept_coverage(question, answer)
-
-    def extract_numbers(self, text):
-        return [float(num) for num in re.findall(r'-?\d+\.?\d*', text)]
-
-    def extract_step_numbers(self, text):
-        steps = text.split('Step')
-        return [self.extract_numbers(step) for step in steps if step.strip()]
-
-    def comprehensive_evaluation(self, question, steps, answer, label_text=None):
-        results = {
-            "coherence": self.evaluate_coherence(question, steps, answer),
-            "step_relevance": self.evaluate_step_relevance(question, steps),
-            "reasoning_complexity": self.evaluate_reasoning_complexity(steps),
-            "numerical_consistency": self.evaluate_numerical_consistency(steps, answer),
-            "concept_coverage": self.evaluate_concept_coverage(question, answer),
-            "explainability": self.evaluate_explainability(question, steps, answer),
-            "solution_efficiency": self.evaluate_solution_efficiency(question, steps),
+        metrics = {
+            'bleu': np.mean(bleu_scores),
+            'rouge1': np.mean(rouge_scores['rouge1']),
+            'rouge2': np.mean(rouge_scores['rouge2']),
+            'rougeL': np.mean(rouge_scores['rougeL']),
+            'f1': np.mean(f1_scores_list)
         }
+        return metrics
+
+    def evaluate_coherence(self, question, cot_steps, answer):
+        # Implementación simple de coherencia basada en la similitud de palabras
+        all_text = question + " " + " ".join([step["text"] for step in cot_steps]) + " " + answer
+        words = set(word_tokenize(all_text.lower()))
         
-        if label_text:
-            results.update({
-                "f1_score": self.evaluate_f1_score(answer, label_text),
-                "f1_with_steps": self.evaluate_f1_score(answer, label_text, with_steps=True),
-                "f1_with_complexity": self.evaluate_f1_with_complexity(answer, label_text),
-                "f1_with_explanation": self.evaluate_f1_with_explanation(answer, label_text),
-            })
+        question_words = set(word_tokenize(question.lower()))
+        answer_words = set(word_tokenize(answer.lower()))
         
-        return results
+        overlap = len(question_words.intersection(answer_words))
+        total_words = len(words)
+        
+        coherence_score = overlap / total_words if total_words > 0 else 0
+        return coherence_score
 
 # Implementación de Hooks para Monitoreo
 class ActivationMonitor:
@@ -274,32 +145,14 @@ class ActivationMonitor:
     def remove_hooks(self):
         for handle in self.handles:
             handle.remove()
-class MoELayer(nn.Module):
-    """
-    Implementa una capa de Mixture of Experts (MoE) que permite el enrutamiento dinámico de la entrada a múltiples expertos.
-    """
-    def __init__(self, input_dim, hidden_dim, num_experts, expert_dim, dropout=0.1, entropy_weight=0.1, top_k=2, dynamic_k=False, max_usage_ratio=0.3):
-        """
-        Inicializa la capa MoE.
 
-        Args:
-            input_dim (int): Dimensión de entrada.
-            hidden_dim (int): Dimensión oculta de los expertos.
-            num_experts (int): Número total de expertos.
-            expert_dim (int): Dimensión de salida de cada experto.
-            dropout (float): Tasa de dropout.
-            entropy_weight (float): Peso para la regularización de entropía.
-            top_k (int): Número inicial de expertos a seleccionar.
-            dynamic_k (bool): Si se debe ajustar dinámicamente el número de expertos.
-            max_usage_ratio (float): Ratio máximo de uso permitido para cada experto.
-        """
+class MoELayer(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_experts, expert_dim, dropout=0.15, entropy_weight=0.1, top_k=2, dynamic_k=False, max_usage_ratio=0.3):
         super(MoELayer, self).__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.dynamic_k = dynamic_k
-        # Lista de expertos (cada uno es una capa lineal)
         self.experts = nn.ModuleList([nn.Linear(input_dim, hidden_dim) for _ in range(num_experts)])
-        # Capa de enrutamiento (gate)
         self.gate = nn.Linear(input_dim, num_experts)
         self.dropout = nn.Dropout(dropout)
         self.entropy_weight = entropy_weight
@@ -307,19 +160,9 @@ class MoELayer(nn.Module):
         self.expert_usage_counter = None
 
     def forward(self, x):
-        """
-        Realiza la pasada hacia adelante de la capa MoE.
-
-        Args:
-            x (Tensor): Tensor de entrada de forma [batch_size, seq_length, input_dim].
-
-        Returns:
-            Tuple[Tensor, Tensor]: Salida procesada y pérdida combinada (entropía + penalización por uso excesivo).
-        """
         batch_size, seq_length, input_dim = x.size()
         x_flat = x.view(-1, input_dim)
         
-        # Calcular probabilidades de enrutamiento
         gate_logits = self.gate(x_flat)
         gate_probs = F.softmax(gate_logits, dim=-1)
 
@@ -327,23 +170,23 @@ class MoELayer(nn.Module):
         entropy = -torch.sum(gate_probs * torch.log(gate_probs + 1e-10), dim=-1).mean()
         entropy_loss = self.entropy_weight * entropy
 
-        # Ajuste dinámico de K (número de expertos a seleccionar)
+        # Ajuste dinámico de K
         if self.dynamic_k:
             complexity = entropy.detach().item()
             K = max(1, min(self.num_experts, int(self.top_k * (1 + complexity))))
         else:
             K = self.top_k
 
-        # Seleccionar los top-K expertos
         topk_probs, topk_indices = torch.topk(gate_probs, K, dim=-1)
 
         # Inicializar o reiniciar el contador de uso de expertos
-        self.expert_usage_counter = torch.zeros(self.num_experts, device=x.device)
+        if self.expert_usage_counter is None:
+            self.expert_usage_counter = torch.zeros(self.num_experts, device=x.device)
+        else:
+            self.expert_usage_counter = self.expert_usage_counter.to(x.device)
 
-        # Preparar el tensor de salida
-        expert_outputs = torch.zeros(batch_size * seq_length, self.experts[0].out_features, device=x.device)
+        expert_outputs = torch.zeros(batch_size * seq_length, self.experts[0].out_features, device=x.device, dtype=x.dtype)
 
-        # Procesar la entrada con los expertos seleccionados
         for k in range(K):
             expert_idx = topk_indices[:, k]
             mask = torch.arange(x_flat.size(0), device=x.device).unsqueeze(1) == expert_idx.unsqueeze(1)
@@ -351,38 +194,35 @@ class MoELayer(nn.Module):
             selected_x = x_flat[mask]
 
             if selected_x.size(0) > 0:
-                expert = self.experts[expert_idx[mask][0]]
-                expert_output = self.dropout(expert(selected_x))
-                expert_outputs[mask] += expert_output * topk_probs[:, k][mask].unsqueeze(1)
-
-                # Actualizar el contador de uso de expertos
-                self.expert_usage_counter[expert_idx[mask][0]] += selected_x.size(0)
+                # Seleccionar el experto de manera eficiente
+                unique_experts = expert_idx[mask].unique()
+                for expert in unique_experts:
+                    expert_mask = expert_idx[mask] == expert
+                    inputs = selected_x[expert_mask]
+                    output = self.dropout(self.experts[expert](inputs))
+                    expert_outputs[mask][expert_mask] += output * topk_probs[:, k][mask][expert_mask].unsqueeze(1)
+                    # Actualizar el contador de uso de expertos
+                    self.expert_usage_counter[expert] += inputs.size(0)
 
         # Calcular la penalización por uso excesivo
         usage_ratios = self.expert_usage_counter / (batch_size * seq_length)
         overuse_penalty = torch.sum(F.relu(usage_ratios - self.max_usage_ratio))
 
-        # Reformatear la salida
         output = expert_outputs.view(batch_size, seq_length, -1)
 
         return output, entropy_loss + overuse_penalty
 
     def get_expert_usage_stats(self):
-        """
-        Obtiene estadísticas de uso de los expertos.
-
-        Returns:
-            List[float] or None: Porcentajes de uso de cada experto, o None si no hay datos disponibles.
-        """
         if self.expert_usage_counter is None:
             return None
         total_usage = self.expert_usage_counter.sum().item()
+        if total_usage == 0:
+            return [0.0] * self.num_experts
         usage_percentages = (self.expert_usage_counter / total_usage * 100).tolist()
         return usage_percentages
+def next_power_of_two(x):
+    return 1 if x == 0 else 2**(x - 1).bit_length()
 class LiquidEmbedding(nn.Module):
-    """
-    Implementa un embedding 'líquido' que adapta dinámicamente la compresión basada en la complejidad de la entrada.
-    """
     def __init__(self, vocab_size, embed_dim, max_length=2048, base_compression_ratio=0.5, min_compression_ratio=0.1):
         """
         Inicializa el módulo LiquidEmbedding.
@@ -398,16 +238,11 @@ class LiquidEmbedding(nn.Module):
         self.embed_dim = embed_dim
         self.base_compression_ratio = base_compression_ratio
         self.min_compression_ratio = min_compression_ratio
-        # Capa de embedding para tokens
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        # Capa de embedding para posiciones
         self.position_embedding = nn.Embedding(max_length, embed_dim)
-        # Capas convolucionales para procesar los embeddings
         self.conv1 = nn.Conv1d(in_channels=embed_dim, out_channels=embed_dim, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(in_channels=embed_dim, out_channels=embed_dim, kernel_size=3, padding=1)
-        # Capa de proyección final
         self.proj = nn.Linear(embed_dim, embed_dim)
-        # Función de pérdida para la reconstrucción
         self.reconstruction_loss_fn = nn.MSELoss()
 
     def forward(self, x):
@@ -435,22 +270,28 @@ class LiquidEmbedding(nn.Module):
         x = self.conv2(x)
         x = F.relu(x)
         x = x.permute(0, 2, 1)
-        x = x.to(torch.float32)
+        # Eliminamos la conversión a float32 para mantener la precisión mixta
+        # x = x.to(torch.float32)  # Esta línea se ha eliminado
+        # Añadir padding para que seq_length sea potencia de 2
+        padded_seq_length = next_power_of_two(seq_length)
+        padding = padded_seq_length - seq_length
+        if padding > 0:
+            x = F.pad(x, (0, 0, 0, padding))  # Agregar padding al final de la secuencia
 
-        # Aplicar FFT para análisis de frecuencia
+        # Aplicar FFT
         x_fft = torch.fft.fft(x, dim=1)
 
-        # Calcular la complejidad de la secuencia basada en la magnitud de las frecuencias
+        # Calcular la complejidad de la secuencia
         magnitude = torch.abs(x_fft)
         complexity = (magnitude > 0.1 * magnitude.max(dim=1, keepdim=True).values).float().mean(dim=(1, 2))
         
-        # Calcular el ratio de compresión dinámico basado en la complejidad
+        # Calcular el ratio de compresión dinámico
         dynamic_compression_ratio = self.base_compression_ratio * (1 - complexity)
         dynamic_compression_ratio = torch.clamp(dynamic_compression_ratio, min=self.min_compression_ratio, max=1.0)
 
         # Calcular N para cada muestra en el batch
         N = (dynamic_compression_ratio * seq_length).long()
-        N = torch.clamp(N, min=1, max=seq_length)
+        N = torch.clamp(N, min=1, max=seq_length)  # Asegurar que N no sea mayor que seq_length
 
         max_N = N.max().item()
 
@@ -466,34 +307,22 @@ class LiquidEmbedding(nn.Module):
         # Reconstrucción usando IFFT
         x_ifft = torch.fft.ifft(x_fft_compressed, n=seq_length, dim=1).real
         x_ifft = self.proj(x_ifft)
-        x_ifft = x_ifft.to(x.dtype)
+        x_ifft = x_ifft.type_as(x)  # Mantener el dtype original
 
         recon_target = torch.fft.ifft(x_fft_compressed, n=seq_length, dim=1).real
-        recon_target = self.proj(recon_target).to(x.dtype)
+        recon_target = self.proj(recon_target).type_as(x)
         
         # Expandir la máscara para que coincida con la forma de x_ifft y recon_target
         mask_expanded = mask.unsqueeze(-1).expand_as(x_ifft)
         
         # Calcular la pérdida de reconstrucción usando la máscara
-        diff = (x_ifft - recon_target).abs() * mask_expanded.float()
-        loss_recon = diff.sum() / mask_expanded.sum() if mask_expanded.sum() > 0 else torch.tensor(0.0, device=x.device)
+        diff = (x_ifft - recon_target).abs() * mask_expanded.float()  # Multiplicar por la máscara
+        loss_recon = diff.sum() / mask_expanded.sum() if mask_expanded.sum() > 0 else torch.tensor(0.0, device=x.device) # Calcular la media enmascarada
 
         return x_ifft, loss_recon
-class EnhancedLocalAttention(nn.Module):
-    """
-    Implementa un mecanismo de atención local mejorado con ventanas superpuestas opcionales.
-    """
-    def __init__(self, embed_dim, num_heads, window_size=256, bidirectional=True, dropout=0.1):
-        """
-        Inicializa el módulo EnhancedLocalAttention.
 
-        Args:
-            embed_dim (int): Dimensión de los embeddings.
-            num_heads (int): Número de cabezas de atención.
-            window_size (int): Tamaño de la ventana de atención local.
-            bidirectional (bool): Si se usa atención bidireccional o no.
-            dropout (float): Tasa de dropout.
-        """
+class EnhancedLocalAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads, window_size=256, bidirectional=True, dropout=0.12):
         super(EnhancedLocalAttention, self).__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -501,112 +330,288 @@ class EnhancedLocalAttention(nn.Module):
         self.bidirectional = bidirectional
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
-        # Capa lineal para generar queries, keys y values
+
         self.qkv = nn.Linear(embed_dim, embed_dim * 3)
-        # Capa de salida
         self.out = nn.Linear(embed_dim, embed_dim)
-        # Capa de dropout
-        self.dropout = nn.Dropout(dropout)
-        
+        self.dropout = dropout
+
     def forward(self, x):
-        """
-        Realiza la pasada hacia adelante del módulo EnhancedLocalAttention.
-
-        Args:
-            x (Tensor): Tensor de entrada de forma [batch_size, seq_length, embed_dim].
-
-        Returns:
-            Tensor: Salida procesada por la atención local.
-        """
         B, L, C = x.shape
-        # Padding para asegurar que la longitud de la secuencia es múltiplo del tamaño de la ventana
-        pad_l = (self.window_size - L % self.window_size) % self.window_size
-        x = F.pad(x, (0, 0, 0, pad_l))
-        _, L_padded, _ = x.shape
         
-        # Generar queries, keys y values
+        # Añadir padding para asegurar que L es múltiplo de window_size
+        pad_l = (self.window_size - L % self.window_size) % self.window_size
+        x = nn.functional.pad(x, (0, 0, 0, pad_l))  # Padding en la dimensión de la longitud
+        _, L_padded, _ = x.shape
+
+        # Calcular qkv y reorganizar
         qkv = self.qkv(x).reshape(B, L_padded, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        if self.bidirectional:
-            # Atención bidireccional con ventanas superpuestas
-            overlapping_size = self.window_size // 2
-            step = overlapping_size
-            window_size = self.window_size
-            q = q.unfold(2, window_size, step).contiguous()
-            k = k.unfold(2, window_size, step).contiguous()
-            v = v.unfold(2, window_size, step).contiguous()
-        else:
-            # Atención unidireccional con ventanas no superpuestas
-            q = q.unfold(2, self.window_size, self.window_size).contiguous()
-            k = k.unfold(2, self.window_size, self.window_size).contiguous()
-            v = v.unfold(2, self.window_size, self.window_size).contiguous()
-        
-        # Calcular puntajes de atención y aplicar softmax
-        attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
-        attn = F.softmax(attn, dim=-1)
-        
-        # Aplicar atención a los values y reorganizar
-        x = (attn @ v).reshape(B, self.num_heads, -1, self.head_dim).permute(0, 2, 1, 3).reshape(B, -1, C)
-        x = self.out(x)
-        x = self.dropout(x)
-        
-        # Devolver la salida sin el padding adicional
-        return x[:, :L]
-class DilatedConvolution(nn.Module):
-    """
-    Implementa una capa de convolución dilatada para capturar dependencias de largo alcance.
-    """
-    def __init__(self, channels, kernel_size, dilation):
-        """
-        Inicializa el módulo DilatedConvolution.
 
-        Args:
-            channels (int): Número de canales de entrada y salida.
-            kernel_size (int): Tamaño del kernel de convolución.
-            dilation (int): Factor de dilatación.
-        """
-        super(DilatedConvolution, self).__init__()
-        self.conv = nn.Conv1d(channels, channels, kernel_size, padding='same', dilation=dilation)
+        # Configurar causalidad
+        causal = not self.bidirectional
+
+        # Verificación de dimensión antes de utilizar unfold
+        if L_padded < self.window_size:
+            raise ValueError("La longitud de la secuencia debe ser al menos igual a window_size.")
+
+        # Manejar ventanas solo si las dimensiones son válidas
+        num_windows = (L_padded - self.window_size) // (self.window_size // 2) + 1  # Calcular el número de ventanas
+
+        # Prepárate para almacenar las salidas de atención
+        attn_outputs = []
+
+        for i in range(num_windows):
+            start_idx = i * (self.window_size // 2)  # Deslizamiento
+            end_idx = start_idx + self.window_size
+            
+            # Asegurarse de que no se sale de límites
+            if end_idx <= L_padded:
+                q_window = q[..., start_idx:end_idx, :]
+                k_window = k[..., start_idx:end_idx, :]
+                v_window = v[..., start_idx:end_idx, :]
+                
+                # Calcular atención para la ventana seleccionada
+                attn_output = flash_attn_func(q_window, k_window, v_window, dropout_p=self.dropout, causal=causal)
+                attn_outputs.append(attn_output)
+
+        # Concatenar resultados de atención
+        attn_output = torch.cat(attn_outputs, dim=2)  # Concatenar por la dimensión donde se acumula la longitud de la ventana
+        attn_output = attn_output.reshape(B, L_padded, C)  # Asegurar la forma adecuada
+        
+        # Aplicar la capa de salida
+        attn_output = self.out(attn_output)
+
+        return attn_output[:, :L, :]   
+class DeformableConv1d(nn.Module):
+    """
+    Implementación de una capa de convolución deformable 1D.
+    
+    Esta capa permite una deformación adaptativa del campo receptivo,
+    lo que puede mejorar la capacidad del modelo para capturar características
+    en diferentes escalas y posiciones.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, bias=True):
+        super(DeformableConv1d, self).__init__()
+        self.kernel_size = kernel_size
+        self.padding = padding  # Debe ser un entero
+        self.stride = stride
+        self.dilation = dilation
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # Convolución para generar los offsets
+        self.offset_conv = nn.Conv1d(
+            in_channels,
+            2 * kernel_size,  # Para desplazamientos en la dimensión de longitud
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=True
+        )
+        
+        # Convolución principal ajustada para recibir C * kernel_size canales
+        self.conv = nn.Conv1d(
+            in_channels * kernel_size,  # Cambiado de in_channels a in_channels * kernel_size
+            out_channels,
+            kernel_size=1,  # Kernel size ajustado para operar sobre los canales
+            stride=1,       # Stride ajustado
+            padding=0,      # Padding ajustado
+            dilation=1,     # Dilation ajustado
+            bias=bias
+        )
         
     def forward(self, x):
         """
-        Realiza la pasada hacia adelante del módulo DilatedConvolution.
-
-        Args:
-            x (Tensor): Tensor de entrada de forma [batch_size, seq_length, channels].
-
-        Returns:
-            Tensor: Salida procesada por la convolución dilatada.
+        x: [N, C, L]
         """
-        # Transponer para aplicar la convolución y luego volver a transponer
-        return self.conv(x.transpose(1, 2)).transpose(1, 2)
+        # Implementamos autocast para habilitar la precisión mixta
+        with autocast(enabled=True):
+            # Calcular los offsets
+            offsets = self.offset_conv(x)  # [N, 2 * kernel_size, L_out]
+            N, _, L_out = offsets.size()
+            offsets = offsets.view(N, self.kernel_size, 2, L_out)  # [N, kernel_size, 2, L_out]
+            offsets = offsets.permute(0, 3, 1, 2)  # [N, L_out, kernel_size, 2]
+
+            # Preparar la entrada para la interpolación
+            x_padded = F.pad(x, (self.padding, self.padding))  # [N, C, L + 2 * padding]
+
+            # Crear mallas para las posiciones
+            device = x.device
+            dtype = x.dtype
+
+            # Crear una malla de posiciones base
+            base_grid = torch.arange(0, x_padded.size(2), device=device, dtype=dtype).unsqueeze(0).unsqueeze(2)  # [1, L_padded, 1]
+            base_grid = base_grid.repeat(N, 1, self.kernel_size)  # [N, L_padded, kernel_size]
+
+            # Aplicar los offsets
+            grid = base_grid[:, self.padding:x_padded.size(2)-self.padding, :] + offsets[..., 0]  # [N, L_out, kernel_size]
+
+            # Limitar los valores del grid para evitar índices fuera de rango
+            grid = grid.clamp(0, x_padded.size(2) - 1)
+
+            # Obtener índices de izquierda y derecha para la interpolación
+            left = grid.floor().long()  # [N, L_out, kernel_size]
+            right = (left + 1).clamp(max=x_padded.size(2) - 1)  # [N, L_out, kernel_size]
+            alpha = grid - left.float()  # [N, L_out, kernel_size]
+
+            # Reshape para gather
+            left = left.view(N, -1).unsqueeze(1).expand(-1, self.in_channels, -1)  # [N, C, L_out * kernel_size]
+            right = right.view(N, -1).unsqueeze(1).expand(-1, self.in_channels, -1)  # [N, C, L_out * kernel_size]
+
+            # Recoger los valores a la izquierda y a la derecha
+            x_left = torch.gather(x_padded, 2, left)  # [N, C, L_out * kernel_size]
+            x_right = torch.gather(x_padded, 2, right)  # [N, C, L_out * kernel_size]
+
+            # Reorganizar para obtener [N, C, L_out, kernel_size]
+            x_left = x_left.view(N, self.in_channels, L_out, self.kernel_size)
+            x_right = x_right.view(N, self.in_channels, L_out, self.kernel_size)
+
+            # Interpolación lineal
+            alpha = alpha.view(N, 1, L_out, self.kernel_size)  # [N, 1, L_out, kernel_size]
+            x_deform = (1 - alpha) * x_left + alpha * x_right  # [N, C, L_out, kernel_size]
+
+            # Reorganizar para la convolución principal
+            x_deform = x_deform.permute(0, 3, 2, 1).contiguous().view(N, self.in_channels * self.kernel_size, L_out)  # [N, C * kernel_size, L_out]
+
+            # Aplicar la convolución principal ajustada
+            out = self.conv(x_deform)  # [N, out_channels, L_out]
+
+        return out
+class OptimizedGatedConvolution(nn.Module):
+    """
+    Implementación optimizada de una capa de convolución con puerta (gated convolution).
+    
+    Esta capa combina una convolución deformable con un mecanismo de puerta,
+    permitiendo al modelo aprender a enfocar dinámicamente diferentes partes de la entrada.
+    Además, implementa normalización de capa y activación GELU para mejorar el rendimiento.
+    """
+    def __init__(self, channels, kernel_size, dilation):
+        super(OptimizedGatedConvolution, self).__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        
+        # Calcular padding para 'same' padding
+        padding = (kernel_size - 1) * dilation // 2
+        
+        # Reemplazar la convolución estándar por DeformableConv1d
+        self.deform_conv = DeformableConv1d(
+            in_channels=channels,
+            out_channels=channels * 2,  # Para main y gate
+            kernel_size=kernel_size,
+            padding=padding,  # Debe ser un entero
+            dilation=dilation
+        )
+        
+        # Inicialización de los parámetros
+        nn.init.kaiming_normal_(self.deform_conv.conv.weight)
+        nn.init.zeros_(self.deform_conv.conv.bias)
+        nn.init.kaiming_normal_(self.deform_conv.offset_conv.weight)
+        nn.init.zeros_(self.deform_conv.offset_conv.bias)
+        
+    def forward(self, x):
+        # Definimos una función interna para usar con checkpoint
+        def conv_function(x):
+            # Implementamos autocast para habilitar la precisión mixta
+            with autocast(enabled=True):
+                # Transponer para que los canales sean la segunda dimensión
+                x = x.transpose(1, 2)  # [batch, channels, seq_length]
+                
+                # Aplicar la convolución deformable y dividir el resultado
+                conv_out = self.deform_conv(x)  # [batch, channels*2, L_out]
+                main, gate = conv_out.chunk(2, dim=1)
+                
+                # Aplicar las funciones de activación
+                main = F.gelu(main)  # GELU para la salida principal
+                gate = torch.sigmoid(gate)  # Sigmoide para la puerta
+                
+                # Aplicar la puerta y normalizar
+                gated_out = main * gate
+                
+                # Normalización de capa
+                mean = gated_out.mean(dim=1, keepdim=True)
+                var = gated_out.var(dim=1, keepdim=True, unbiased=False)
+                gated_out = (gated_out - mean) / (var + 1e-5).sqrt()
+                
+                # Volver a transponer para mantener la forma original
+                return gated_out.transpose(1, 2)  # [batch, L_out, channels]
+
+        # Usamos checkpoint para ahorrar memoria durante el entrenamiento
+        return checkpoint(conv_function, x)
+
+def test_deformable_conv1d():
+    batch_size = 2
+    in_channels = 4
+    out_channels = 8
+    seq_length = 16
+    kernel_size = 3
+    dilation = 1
+    stride = 1
+    padding = (kernel_size - 1) * dilation // 2
+
+    x = torch.randn(batch_size, in_channels, seq_length)  # [N, C, L]
+    deform_conv = DeformableConv1d(in_channels, out_channels, kernel_size, stride, padding, dilation)
+    out = deform_conv(x)
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {out.shape}")
+
+test_deformable_conv1d()
+
+def test_optimized_gated_convolution():
+    batch_size = 2
+    channels = 4
+    seq_length = 16
+    kernel_size = 3
+    dilation = 1
+
+    x = torch.randn(batch_size, seq_length, channels)  # [batch, seq_length, channels]
+    gated_conv = OptimizedGatedConvolution(channels, kernel_size, dilation)
+    out = gated_conv(x)
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {out.shape}")
+
+test_optimized_gated_convolution()
+
+
+class EnhancedLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=1, dropout=0.1):
+        super(EnhancedLSTM, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # LSTM estándar de PyTorch
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        
+        # Capa de salida adicional con GELU
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, input_size)
+        )
+
+    def forward(self, x, hidden=None):
+        # Pasar a través del LSTM
+        lstm_out, hidden = self.lstm(x, hidden)
+        
+        # Aplicar la capa de salida con conexión residual
+        output = self.output_layer(lstm_out) + x
+        
+        return output, hidden
+
+    def init_hidden(self, batch_size):
+        weight = next(self.parameters()).data
+        hidden = (weight.new(self.num_layers, batch_size, self.hidden_size).zero_().to(weight.device),
+                  weight.new(self.num_layers, batch_size, self.hidden_size).zero_().to(weight.device))
+        return hidden
 class ImprovedTransformerBlock(nn.Module):
-    """
-    Implementa un bloque de transformador mejorado con atención local, convolución dilatada y MoE.
-    """
     def __init__(self, embed_dim, num_heads, ff_hidden_dim, num_experts, expert_dim, window_size=256, bidirectional=True, dropout=0.12, entropy_weight=0.1, top_k=2, dynamic_k=False):
-        """
-        Inicializa el módulo ImprovedTransformerBlock.
-
-        Args:
-            embed_dim (int): Dimensión de los embeddings.
-            num_heads (int): Número de cabezas de atención.
-            ff_hidden_dim (int): Dimensión oculta de la capa feed-forward.
-            num_experts (int): Número de expertos en la capa MoE.
-            expert_dim (int): Dimensión de salida de cada experto.
-            window_size (int): Tamaño de la ventana para la atención local.
-            bidirectional (bool): Si se usa atención bidireccional.
-            dropout (float): Tasa de dropout.
-            entropy_weight (float): Peso para la regularización de entropía en MoE.
-            top_k (int): Número de expertos a seleccionar en MoE.
-            dynamic_k (bool): Si se ajusta dinámicamente el número de expertos.
-        """
         super(ImprovedTransformerBlock, self).__init__()
         self.attention = EnhancedLocalAttention(embed_dim, num_heads, window_size, bidirectional)
         self.norm1 = nn.LayerNorm(embed_dim)
         self.dropout1 = nn.Dropout(dropout)
-        self.dilated_conv = DilatedConvolution(embed_dim, kernel_size=3, dilation=2)
+        self.dilated_conv = OptimizedGatedConvolution(embed_dim, kernel_size=3, dilation=2)
         self.norm2 = nn.LayerNorm(embed_dim)
         self.dropout2 = nn.Dropout(dropout)
         self.moe = MoELayer(
@@ -629,34 +634,22 @@ class ImprovedTransformerBlock(nn.Module):
         )
         
     def forward(self, x):
-        """
-        Realiza la pasada hacia adelante del módulo ImprovedTransformerBlock.
-
-        Args:
-            x (Tensor): Tensor de entrada.
-
-        Returns:
-            Tuple[Tensor, Tensor]: Salida procesada y pérdida de entropía.
-        """
-        # Aplicar atención local y residual
-        x = x + self.dropout1(self.attention(self.norm1(x)))
-        # Aplicar convolución dilatada y residual
-        x = x + self.dropout2(self.dilated_conv(self.norm2(x)))
-        # Aplicar MoE y residual
-        moe_output, entropy_loss = self.moe(self.norm3(x))
-        x = x + self.dropout3(moe_output)
-        # Aplicar capa feed-forward y residual
-        x = x + self.ff_layer(x)
+        # Utilizar autocast para mantener la precisión mixta
+        with torch.cuda.amp.autocast(enabled=True):
+            x = x + self.dropout1(self.attention(self.norm1(x)))
+            x = x + self.dropout2(self.dilated_conv(self.norm2(x)))
+            moe_output, entropy_loss = self.moe(self.norm3(x))
+            x = x + self.dropout3(moe_output)
+            x = x + self.ff_layer(x)
         return x, entropy_loss
+
+
+
+# Clase BidirectionalEncoder actualizada para pasar top_k y dynamic_k a los bloques
 class BidirectionalEncoder(nn.Module):
-    """
-    Implementa un codificador bidireccional con múltiples capas de transformador mejorado.
-    """
     def __init__(self, vocab_size, embed_dim, max_length=2048, compression_ratio=0.5, num_layers=4, num_heads=8, ff_hidden_dim=1024, window_size=256, num_experts=2, expert_dim=256, entropy_weight=0.1, top_k=2, dynamic_k=False):
         super(BidirectionalEncoder, self).__init__()
-        # Capa de embedding líquido
         self.embedding = LiquidEmbedding(vocab_size, embed_dim, max_length, base_compression_ratio=compression_ratio)
-        # Lista de capas de transformador mejorado
         self.layers = nn.ModuleList([
             ImprovedTransformerBlock(
                 embed_dim=embed_dim, 
@@ -673,58 +666,23 @@ class BidirectionalEncoder(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        # Normalización final
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
-        """
-        Realiza la pasada hacia adelante del codificador bidireccional.
-
-        Args:
-            x (Tensor): Tensor de entrada de forma [batch_size, seq_length].
-
-        Returns:
-            Tuple[Tensor, Tensor, Tensor]: Salida procesada, pérdida de reconstrucción y pérdida de entropía total.
-        """
-        # Aplicar embedding líquido
-        x, recon_loss = self.embedding(x)
-        total_entropy_loss = 0
-        # Pasar por cada capa de transformador
-        for layer in self.layers:
-            x, entropy_loss = layer(x)
-            total_entropy_loss += entropy_loss
-        # Normalización final
-        x = self.layer_norm(x)
+        # Utilizar autocast para mantener la precisión mixta
+        with autocast(enabled=True):
+            x, recon_loss = self.embedding(x)
+            total_entropy_loss = 0
+            for layer in self.layers:
+                x, entropy_loss = layer(x)
+                total_entropy_loss += entropy_loss
+            x = self.layer_norm(x)
         return x, recon_loss, total_entropy_loss
 class LiquidFoundationModelOptimized(nn.Module):
-    """
-    Implementa un modelo de fundación 'líquido' optimizado que combina un codificador bidireccional
-    y un decodificador con capas de transformador mejoradas y embedding líquido.
-    """
     def __init__(self, vocab_size, embed_dim=256, num_layers=4, num_heads=8, ff_hidden_dim=1024,
                  num_experts=4, expert_dim=256, max_length=2048, window_size=256, compression_ratio=0.5, 
-                 entropy_weight=0.1, top_k=2, dynamic_k=False):
-        """
-        Inicializa el modelo LiquidFoundationModelOptimized.
-
-        Args:
-            vocab_size (int): Tamaño del vocabulario.
-            embed_dim (int): Dimensión de los embeddings.
-            num_layers (int): Número de capas en el codificador y decodificador.
-            num_heads (int): Número de cabezas de atención en cada capa.
-            ff_hidden_dim (int): Dimensión oculta de la capa feed-forward.
-            num_experts (int): Número de expertos en la capa MoE.
-            expert_dim (int): Dimensión de salida de cada experto.
-            max_length (int): Longitud máxima de la secuencia.
-            window_size (int): Tamaño de la ventana para la atención local.
-            compression_ratio (float): Ratio de compresión para el embedding líquido.
-            entropy_weight (float): Peso para la regularización de entropía en MoE.
-            top_k (int): Número inicial de expertos a seleccionar en MoE.
-            dynamic_k (bool): Si se ajusta dinámicamente el número de expertos en MoE.
-        """
+                 entropy_weight=0.1, top_k=2, dynamic_k=False, lstm_hidden_size=256, lstm_num_layers=2):
         super(LiquidFoundationModelOptimized, self).__init__()
-        
-        # Inicializar el codificador bidireccional
         self.encoder = BidirectionalEncoder(
             vocab_size=vocab_size,
             embed_dim=embed_dim,
@@ -740,8 +698,6 @@ class LiquidFoundationModelOptimized(nn.Module):
             top_k=top_k,
             dynamic_k=dynamic_k
         )
-        
-        # Inicializar el embedding líquido para el decodificador
         self.decoder_embedding = LiquidEmbedding(
             vocab_size, 
             embed_dim, 
@@ -749,8 +705,6 @@ class LiquidFoundationModelOptimized(nn.Module):
             base_compression_ratio=0.5, 
             min_compression_ratio=0.1
         )
-        
-        # Inicializar las capas del decodificador
         self.decoder_layers = nn.ModuleList([
             ImprovedTransformerBlock(
                 embed_dim=embed_dim, 
@@ -759,7 +713,7 @@ class LiquidFoundationModelOptimized(nn.Module):
                 num_experts=num_experts, 
                 expert_dim=expert_dim, 
                 window_size=window_size, 
-                bidirectional=False,  # El decodificador es unidireccional
+                bidirectional=False, 
                 dropout=0.12, 
                 entropy_weight=entropy_weight, 
                 top_k=top_k, 
@@ -767,68 +721,52 @@ class LiquidFoundationModelOptimized(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        
-        # Capa de normalización final
         self.layer_norm = nn.LayerNorm(embed_dim)
-        
-        # Capa de salida para generar logits sobre el vocabulario
         self.output_layer = nn.Linear(embed_dim, vocab_size)
-        
         self.max_length = max_length
         self.compression_ratio = compression_ratio
+        
+        # Reemplazar xLSTM con EnhancedLSTM
+        self.external_memory = EnhancedLSTM(embed_dim, lstm_hidden_size, num_layers=lstm_num_layers)
 
     def forward(self, encoder_input_ids, decoder_input_ids):
-        """
-        Realiza la pasada hacia adelante del modelo.
+        with autocast(enabled=True):
+            encoder_output, recon_loss_enc, entropy_loss_enc = self.encoder(encoder_input_ids)
+            decoder_embeddings, recon_loss_dec = self.decoder_embedding(decoder_input_ids)
+            
+            # Inicializar el estado oculto del EnhancedLSTM
+            batch_size = decoder_embeddings.size(0)
+            hidden = self.external_memory.init_hidden(batch_size)
+            
+            total_entropy_loss_dec = 0
+            for layer in self.decoder_layers:
+                decoder_embeddings, entropy_loss = layer(decoder_embeddings)
+                total_entropy_loss_dec += entropy_loss
+                
+                # Actualizar la memoria externa con EnhancedLSTM
+                decoder_embeddings, hidden = self.external_memory(decoder_embeddings, hidden)
+            
+            decoder_embeddings = self.layer_norm(decoder_embeddings)
+            logits = self.output_layer(decoder_embeddings)
+        
+        return logits[:, :2048, :], recon_loss_enc, recon_loss_dec, entropy_loss_enc, total_entropy_loss_dec
 
-        Args:
-            encoder_input_ids (Tensor): IDs de entrada para el codificador.
-            decoder_input_ids (Tensor): IDs de entrada para el decodificador.
-
-        Returns:
-            Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: 
-                - Logits de salida
-                - Pérdida de reconstrucción del codificador
-                - Pérdida de reconstrucción del decodificador
-                - Pérdida de entropía del codificador
-                - Pérdida de entropía total del decodificador
-        """
-        # Procesar la entrada a través del codificador
-        encoder_output, recon_loss_enc, entropy_loss_enc = self.encoder(encoder_input_ids)
-        
-        # Aplicar embedding líquido a la entrada del decodificador
-        decoder_embeddings, recon_loss_dec = self.decoder_embedding(decoder_input_ids)
-        
-        total_entropy_loss_dec = 0
-        # Pasar por cada capa del decodificador
-        for layer in self.decoder_layers:
-            decoder_embeddings, entropy_loss = layer(decoder_embeddings)
-            total_entropy_loss_dec += entropy_loss
-        
-        # Aplicar normalización final
-        decoder_embeddings = self.layer_norm(decoder_embeddings)
-        
-        # Generar logits de salida
-        logits = self.output_layer(decoder_embeddings)
-        
-        # Limitar la salida a max_length
-        return logits[:, :self.max_length, :], recon_loss_enc, recon_loss_dec, entropy_loss_enc, total_entropy_loss_dec
-# Funciones auxiliares
 def prepare_data(max_samples=None, val_size=0.1):
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     special_tokens = {'pad_token': '[PAD]', 'eos_token': '<EOS>', 'bos_token': '<BOS>'}
     num_added_toks = tokenizer.add_special_tokens(special_tokens)
     print(f"Se agregaron {num_added_toks} tokens especiales al tokenizer.")
     
-    dataset = load_dataset("TIGER-Lab/MathInstruct")
+    # Cambiamos el dataset a "wikitext-2-raw-v1"
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
     
     if max_samples is not None and max_samples < len(dataset['train']):
         dataset['train'] = dataset['train'].select(range(max_samples))
     
     def preprocess(examples):
         combined_texts = [
-            f"{tokenizer.bos_token} Fuente: {source}\nInstrucción: {instruction}\nRazonamiento: {output} {tokenizer.eos_token}"
-            for source, instruction, output in zip(examples['source'], examples['instruction'], examples['output'])
+            f"{tokenizer.bos_token} {text}{tokenizer.eos_token}"
+            for text in examples['text'] if text.strip()  # Only process non-empty strings
         ]
         tokens = tokenizer(combined_texts, truncation=True, max_length=2048, padding='max_length')
         decoder_input_ids = [[tokenizer.bos_token_id] + ids[:-1] for ids in tokens['input_ids']]
@@ -840,7 +778,8 @@ def prepare_data(max_samples=None, val_size=0.1):
             for label in tokens['labels']
         ]
         return tokens
-    tokenized_dataset = dataset['train'].map(preprocess, batched=True, batch_size=1000)
+    
+    tokenized_dataset = dataset['train'].map(preprocess, batched=True, batch_size=1000, remove_columns=dataset['train'].column_names)
     tokenized_dataset.set_format(type='torch', columns=['input_ids', 'decoder_input_ids', 'labels', 'attention_mask'])
     
     train_val_dataset = tokenized_dataset.train_test_split(test_size=val_size)
@@ -852,7 +791,6 @@ def calculate_metrics(model, data_loader, criterion, device, tokenizer):
     total_loss = 0
     total_recon_loss = 0
     total_entropy_loss = 0
-    total_gradients = 0
     total_tokens = 0
     with torch.no_grad():
         for batch in data_loader:
@@ -861,17 +799,18 @@ def calculate_metrics(model, data_loader, criterion, device, tokenizer):
             labels = batch['labels'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             
-            outputs, recon_loss_enc, recon_loss_dec, entropy_loss_enc, entropy_loss_dec = model(encoder_input_ids, decoder_input_ids)
-            logits = outputs.reshape(-1, outputs.size(-1))
-            labels_flat = labels.reshape(-1)
-            
-            mask = labels_flat != -100
-            logits = logits[mask]
-            labels_flat = labels_flat[mask]
-            
-            loss = criterion(logits, labels_flat) + recon_loss_enc + recon_loss_dec + entropy_loss_enc + entropy_loss_dec
-            total_loss += loss.item() * labels_flat.numel()
-            total_tokens += labels_flat.numel()
+            with autocast(enabled=True):
+                outputs, recon_loss_enc, recon_loss_dec, entropy_loss_enc, entropy_loss_dec = model(encoder_input_ids, decoder_input_ids)
+                logits = outputs.reshape(-1, outputs.size(-1))
+                labels_flat = labels.reshape(-1)
+                
+                mask = labels_flat != -100
+                logits = logits[mask]
+                labels_flat = labels_flat[mask]
+                
+                loss = criterion(logits, labels_flat) + recon_loss_enc + recon_loss_dec + entropy_loss_enc + entropy_loss_dec
+                total_loss += loss.item() * labels_flat.numel()
+                total_tokens += labels_flat.numel()
     
     avg_loss = total_loss / total_tokens
     perplexity = math.exp(avg_loss)
@@ -918,7 +857,7 @@ class OptimizedFocalLoss(nn.Module):
             
             return total_loss / total_count if total_count > 0 else total_loss
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, scaler, device, num_epochs, accumulation_steps=4, evaluator=None, tokenizer=None, monitor=None):
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, scaler, device, num_epochs, accumulation_steps=8, evaluator=None, tokenizer=None, monitor=None):
     writer = SummaryWriter()
     best_val_loss = float('inf')
     patience = 3
@@ -937,9 +876,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             encoder_input_ids = batch['input_ids'].to(device)
             decoder_input_ids = batch['decoder_input_ids'].to(device)
             labels = batch['labels'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
 
-            with torch.cuda.amp.autocast(enabled=True):
+            with autocast(enabled=True):
                 outputs, recon_loss_enc, recon_loss_dec, entropy_loss_enc, entropy_loss_dec = model(encoder_input_ids, decoder_input_ids)
                 logits = outputs.reshape(-1, outputs.size(-1))
                 labels_flat = labels.reshape(-1)
@@ -965,14 +903,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             total_entropy_loss += (entropy_loss_enc + entropy_loss_dec).item() * accumulation_steps
             total_batches += 1
 
-            # Monitoreo de activaciones y gradientes
             if monitor and (batch_idx + 1) % 800 == 0:
                 for name, activation in monitor.activations.items():
                     writer.add_histogram(f'Activations/{name}', activation.cpu().numpy(), epoch)
                 for name, gradient in monitor.gradients.items():
                     writer.add_histogram(f'Gradients/{name}', gradient.cpu().numpy(), epoch)
 
-            # Validación periódica dentro del epoch
             if (batch_idx + 1) % 800 == 0:
                 avg_train_loss = total_loss / total_batches
                 avg_recon_loss = total_recon_loss / total_batches
@@ -980,10 +916,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 val_loss, val_perplexity = calculate_metrics(model, val_loader, criterion, device, tokenizer)
                 
                 loop.set_postfix(train_loss=avg_train_loss, recon_loss=avg_recon_loss, entropy_loss=avg_entropy_loss, val_loss=val_loss, val_perplexity=val_perplexity)
-            if (batch_idx + 1) % 100 == 0:  # Cada 100 lotes
+
+            if (batch_idx + 1) % 100 == 0:
                 for idx, layer in enumerate(model.encoder.layers):
                     usage_stats = layer.moe.get_expert_usage_stats()
                     print(f"Epoch {epoch}, Batch {batch_idx+1}, Layer {idx} Expert Usage: {usage_stats}")
+
         scheduler.step()
 
         avg_train_loss = total_loss / total_batches
@@ -1022,6 +960,16 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
     writer.close()
 
+def calculate_evaluation_metrics(evaluator, questions, answers, labels):
+    metrics = evaluator.calculate_metrics(questions, answers, labels)
+    coherence = np.mean([evaluator.evaluate_coherence(q, [], a) for q, a in zip(questions, answers)])
+    metrics['coherence'] = coherence
+    return metrics
+
+def print_metrics(metrics):
+    for metric, value in metrics.items():
+        print(f"{metric.capitalize()}: {value:.4f}")
+
 def evaluate_model(model, val_loader, evaluator, tokenizer, device, writer, epoch):
     model.eval()
     all_questions = []
@@ -1037,14 +985,16 @@ def evaluate_model(model, val_loader, evaluator, tokenizer, device, writer, epoc
                 question = tokenizer.decode(encoder_input_ids[i], skip_special_tokens=True)
                 answer = tokenizer.decode(preds[i], skip_special_tokens=True)
                 
-                # Manejar tokens nulos en las etiquetas
-                label_tokens = [token for token in batch['labels'][i] if token != -100]  # Filtrar tokens de relleno
-                label_tokens = [token for token in label_tokens if token is not None]  # Filtrar tokens nulos
+                label_tokens = [token for token in batch['labels'][i] if token != -100 and token is not None]
                 label = tokenizer.decode(label_tokens, skip_special_tokens=True)
                 
                 all_questions.append(question)
                 all_answers.append(answer)
                 all_labels.append(label)
+
+    print(f"Longitud de all_questions: {len(all_questions)}")
+    print(f"Longitud de all_answers: {len(all_answers)}")
+    print(f"Longitud de all_labels: {len(all_labels)}")
     
     metrics = calculate_evaluation_metrics(evaluator, all_questions, all_answers, all_labels)
     
@@ -1053,66 +1003,26 @@ def evaluate_model(model, val_loader, evaluator, tokenizer, device, writer, epoc
     
     print_metrics(metrics)
 
-def calculate_evaluation_metrics(evaluator, questions, answers, labels):
-    coherence_scores = []
-    f1_scores = []
-    bleu_scores = []
-    rouge_scores = {'rouge1': [], 'rouge2': [], 'rougeL': []}
-    
-    for q, a, l in zip(questions, answers, labels):
-        coherence = evaluator.evaluate_coherence(q, [], a)
-        coherence_scores.append(coherence)
-        
-        f1 = evaluator.evaluate_f1_score(a, l)
-        f1_scores.append(f1)
-
-        chencherry = SmoothingFunction()
-        bleu = sentence_bleu([word_tokenize(l.lower())], word_tokenize(a.lower()), smoothing_function=chencherry.method1)
-        bleu_scores.append(bleu)
-        rouge = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-        rouge_result = rouge.score(l, a)
-        rouge_scores['rouge1'].append(rouge_result['rouge1'].fmeasure)
-        rouge_scores['rouge2'].append(rouge_result['rouge2'].fmeasure)
-        rouge_scores['rougeL'].append(rouge_result['rougeL'].fmeasure)
-    
-    metrics = {
-        'coherence': np.mean(coherence_scores),
-        'f1': np.mean(f1_scores),
-        'bleu': np.mean(bleu_scores),
-        'rouge1': np.mean(rouge_scores['rouge1']),
-        'rouge2': np.mean(rouge_scores['rouge2']),
-        'rougeL': np.mean(rouge_scores['rougeL'])
-    }
-    
-    return metrics
-
-def print_metrics(metrics):
-    print(f"Coherence: {metrics['coherence']:.4f}")
-    print(f"F1: {metrics['f1']:.4f}")
-    print(f"BLEU: {metrics['bleu']:.4f}")
-    print(f"ROUGE-1: {metrics['rouge1']:.4f}")
-    print(f"ROUGE-2: {metrics['rouge2']:.4f}")
-    print(f"ROUGE-L: {metrics['rougeL']:.4f}")
-
 def resize_embeddings(model, tokenizer, new_vocab_size, embed_dim):
     old_embedding = model.encoder.embedding.token_embedding
     new_embedding = nn.Embedding(new_vocab_size, embed_dim)
     
-    new_embedding.weight.data[:old_embedding.num_embeddings, :] = old_embedding.weight.data
-    nn.init.normal_(new_embedding.weight.data[old_embedding.num_embeddings:, :], mean=0.0, std=0.02)
+    with torch.no_grad():
+        new_embedding.weight.data[:old_embedding.num_embeddings, :] = old_embedding.weight.data
+        nn.init.normal_(new_embedding.weight.data[old_embedding.num_embeddings:, :], mean=0.0, std=0.02)
     
     model.encoder.embedding.token_embedding = new_embedding.to(device)
     
     model.decoder_embedding.token_embedding = new_embedding.to(device)
     
     model.output_layer = nn.Linear(embed_dim, new_vocab_size).to(device)
-    nn.init.normal_(model.output_layer.weight, mean=0.0, std=0.02)
-    model.output_layer.bias.data.zero_()
+    with torch.no_grad():
+        nn.init.normal_(model.output_layer.weight, mean=0.0, std=0.02)
+        model.output_layer.bias.data.zero_()
     
     print(f"Capa de salida actualizada: {model.output_layer}")
 
-# Función principal actualizada para pasar top_k y dynamic_k
-def main(max_samples=1000):
+def main(max_samples=10000):
     tokenizer, train_val_dataset = prepare_data(max_samples)
     
     VOCAB_SIZE = len(tokenizer)
@@ -1133,9 +1043,11 @@ def main(max_samples=1000):
         max_length=MAX_LENGTH,
         window_size=WINDOW_SIZE,
         compression_ratio=COMPRESSION_RATIO,
-        entropy_weight=0.1,  # Añadir peso para regularización de entropía
+        entropy_weight=0.25,
         top_k=TOP_K,
-        dynamic_k=DYNAMIC_K
+        dynamic_k=DYNAMIC_K,
+        lstm_hidden_size=128,  # Tamaño del estado oculto del EnhancedLSTM
+        lstm_num_layers=2      # Número de capas del EnhancedLSTM
     ).to(device)
 
     resize_embeddings(model, tokenizer, VOCAB_SIZE, EMBED_DIM)
@@ -1144,13 +1056,12 @@ def main(max_samples=1000):
     print(f"Dimensión de output_layer: {model.output_layer.weight.shape}")
 
     criterion = OptimizedFocalLoss(ignore_index=-100, label_smoothing=0.1)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.001)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     scaler = GradScaler()
 
-    evaluator = MathEvaluator()
+    evaluator = TextEvaluator()
 
-    # Inicializar monitor de activaciones y gradientes
     monitor = ActivationMonitor(model)
 
     train_model(
@@ -1172,59 +1083,108 @@ def main(max_samples=1000):
     monitor.remove_hooks()
 
     return model, tokenizer
-def unified_generate(model, tokenizer, prompt, device, reasoning=True, 
-                     max_length=512, beam_width=5, temperature=1.0, 
-                     top_p=0.9, repetition_penalty=1.2, max_step_tokens=70, 
-                     max_answer_tokens=30, top_k=50, num_steps=4, 
-                     max_attempts=4, num_iterations=3, evaluator=None):
-    """
-    Genera texto utilizando el modelo entrenado.
 
-    Parámetros:
-    - max_length (int, default=512): 
-      Longitud máxima de la secuencia generada. 
-      Rango recomendado: 64-1024. Ajustar según las necesidades específicas y recursos disponibles.
+from collections import OrderedDict
+import hashlib
+import numpy as np
 
-    - beam_width (int, default=5): 
-      Número de beams en la búsqueda de beam. Valores más altos pueden mejorar la calidad pero aumentan el tiempo de generación.
-      Rango recomendado: 1-10. Valores mayores a 5 suelen tener rendimientos decrecientes.
+class DynamicCacheManager:
+    def __init__(self, max_size=1000, base_compression_ratio=0.5, min_compression_ratio=0.1):
+        self.cache = OrderedDict()  # Utiliza OrderedDict para mantener el orden de uso
+        self.max_size = max_size
+        self.base_compression_ratio = base_compression_ratio
+        self.min_compression_ratio = min_compression_ratio
 
-    - temperature (float, default=1.0): 
-      Controla la aleatoriedad de la generación. Valores más bajos hacen la salida más determinista.
-      Rango recomendado: 0.5-1.5. Valores cercanos a 0 pueden llevar a repeticiones, mientras que valores muy altos pueden producir incoherencias.
+    def _generate_key(self, prompt, max_length, beam_width, temperature, top_p, repetition_penalty, max_step_tokens, max_answer_tokens, top_k, num_steps):
+        key = f"{prompt}_{max_length}_{beam_width}_{temperature}_{top_p}_{repetition_penalty}_{max_step_tokens}_{max_answer_tokens}_{top_k}_{num_steps}"
+        return hashlib.md5(key.encode()).hexdigest()
 
-    - top_p (float, default=0.9): 
-      Umbral de probabilidad acumulativa para muestreo nucleico. Controla la diversidad de la salida.
-      Rango recomendado: 0.7-1.0. Valores más bajos aumentan la coherencia pero pueden limitar la creatividad.
+    def _calculate_complexity(self, data_array):
+        fft_result = np.fft.fft(data_array)
+        magnitude = np.abs(fft_result)
+        complexity = (magnitude > 0.1 * magnitude.max()).mean()
+        return complexity
 
-    - repetition_penalty (float, default=1.2): 
-      Penalización para la repetición de tokens. Valores más altos desalientan las repeticiones.
-      Rango recomendado: 1.0-1.5. Ajustar con cuidado, ya que valores muy altos pueden afectar la coherencia.
+    def _compress_data(self, data):
+        if isinstance(data, tuple):
+            # Convertir la tupla a una lista para procesarla
+            data_list = list(data)
+            # Convertir cada elemento de la lista a bytes
+            data_bytes = [str(item).encode() for item in data_list]
+            # Concatenar todos los bytes
+            data_array = np.frombuffer(b''.join(data_bytes), dtype=np.uint8)
+        elif isinstance(data, str):
+            data_array = np.frombuffer(data.encode(), dtype=np.uint8)
+        elif isinstance(data, list):
+            data_array = np.array(data)
+        else:
+            raise ValueError(f"Tipo de dato no soportado para compresión: {type(data)}")
 
-    - max_step_tokens (int, default=70): 
-      Número máximo de tokens por paso de razonamiento.
-      Ajustar según la complejidad deseada de cada paso. Rango típico: 50-100.
+        complexity = self._calculate_complexity(data_array)
+        dynamic_compression_ratio = self.base_compression_ratio * (1 - complexity)
+        dynamic_compression_ratio = max(self.min_compression_ratio, dynamic_compression_ratio)
 
-    - max_answer_tokens (int, default=30): 
-      Número máximo de tokens para la respuesta final.
-      Ajustar según la longitud deseada de la respuesta. Rango típico: 20-50.
+        fft_result = np.fft.fft(data_array)
+        compressed_size = int(len(fft_result) * dynamic_compression_ratio)
+        compressed_fft = fft_result[:compressed_size]
+        
+        return compressed_fft, dynamic_compression_ratio
 
-    - top_k (int, default=50): 
-      Número de tokens de mayor probabilidad a considerar en cada paso de generación.
-      Rango recomendado: 20-100. Valores más bajos aumentan la coherencia pero pueden limitar la diversidad.
+    def _decompress_data(self, compressed_data, compression_ratio, original_type):
+        full_size = int(len(compressed_data) / compression_ratio)
+        reconstructed_fft = np.zeros(full_size, dtype=complex)
+        reconstructed_fft[:len(compressed_data)] = compressed_data
 
-    - num_steps (int, default=4): 
-      Número de pasos de razonamiento.
-      Ajustar según la complejidad del problema. Rango típico: 2-6.
+        decompressed_array = np.fft.ifft(reconstructed_fft).real.astype(np.uint8)
+        decompressed_bytes = decompressed_array.tobytes()
 
-    - max_attempts (int, default=4): 
-      Número máximo de intentos de generación.
-      Aumentar si se encuentran frecuentes fallos de generación. Rango típico: 1-5.
+        if original_type == str:
+            return decompressed_bytes.decode()
+        elif original_type == list:
+            return decompressed_array.tolist()
+        elif original_type == tuple:
+            # Dividir los bytes decomprimidos en sus componentes originales
+            components = decompressed_bytes.split(b'\x00')  # Asumimos que '\x00' separa los componentes
+            return tuple(eval(comp.decode()) for comp in components if comp)
+        else:
+            raise ValueError(f"Tipo de dato no soportado para descompresión: {original_type}")
 
-    - num_iterations (int, default=3): 
-      Número de iteraciones de refinamiento.
-      Más iteraciones pueden mejorar la calidad pero aumentan el tiempo de generación. Rango típico: 1-5.
-    """    
+    def get(self, key):
+        if key in self.cache:
+            # Mover la clave al final para marcarla como recientemente usada
+            self.cache.move_to_end(key)
+            compressed_data, compression_ratio, original_type = self.cache[key]
+            return self._decompress_data(compressed_data, compression_ratio, original_type)
+        return None
+
+    def set(self, key, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        elif len(self.cache) >= self.max_size:
+            removed_key, _ = self.cache.popitem(last=False)
+            print(f"Eliminada la entrada menos recientemente usada: {removed_key}")
+        
+        original_type = type(value)
+        compressed_data, compression_ratio = self._compress_data(value)
+        self.cache[key] = (compressed_data, compression_ratio, original_type)
+
+
+# Inicializa el DynamicCacheManager con política LRU
+dynamic_cache_manager = DynamicCacheManager(max_size=1000)
+
+
+def unified_generate(model, tokenizer, prompt, device, reasoning=True, max_length=512, beam_width=5, temperature=1.0, top_p=0.9, repetition_penalty=1.2, max_step_tokens=70, max_answer_tokens=30, top_k=50, num_steps=4, max_attempts=4, num_iterations=3, evaluator=None):
+    cache_key = dynamic_cache_manager._generate_key(
+        prompt, max_length, beam_width, temperature, top_p, repetition_penalty,
+        max_step_tokens, max_answer_tokens, top_k, num_steps
+    )
+
+    cached_result = dynamic_cache_manager.get(cache_key)
+    if cached_result is not None:
+        print("Resultado recuperado del caché")
+        return cached_result
+
+    model.to(device)
     model.eval()
 
     best_overall_response = ""
@@ -1266,8 +1226,12 @@ def unified_generate(model, tokenizer, prompt, device, reasoning=True,
         coherence = evaluator.evaluate_coherence(prompt, best_overall_cot_steps, best_overall_response)
         print(f"Puntuación de coherencia final: {coherence:.4f}")
 
-    return best_overall_response, best_overall_cot_steps, best_overall_coherence
+    result = (best_overall_response, best_overall_cot_steps, best_overall_coherence)
+    
+    # Almacena el resultado comprimido en el caché
+    dynamic_cache_manager.set(cache_key, result)
 
+    return result
 def generate_cot(model, tokenizer, prompt, device, max_step_tokens=70, max_answer_tokens=30, temperature=0.7, top_k=50, beam_width=5, top_p=0.9, repetition_penalty=1.2, num_steps=4, max_attempts=4):
     model.to(device)
     model.eval()
@@ -1277,7 +1241,7 @@ def generate_cot(model, tokenizer, prompt, device, max_step_tokens=70, max_answe
 
     for attempt in range(max_attempts):
         try:
-            with torch.no_grad(), torch.cuda.amp.autocast():
+            with torch.no_grad(), autocast(enabled=True):
                 encoder_input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
                 decoder_input_ids = torch.tensor([[tokenizer.bos_token_id]], device=device)
                 cot_steps = []
@@ -1333,7 +1297,7 @@ def generate_step(model, tokenizer, encoder_input_ids, decoder_input_ids, max_to
         # Aplanar las secuencias para procesarlas en batch
         flat_sequences = sequences.view(-1, sequences.size(-1))  # [batch * beam_width, seq_len]
         
-        with torch.cuda.amp.autocast(enabled=True):
+        with autocast(enabled=True):
             outputs, _, _, _, _ = model(encoder_input_ids, flat_sequences)
             logits = outputs[:, -1, :] / temperature  # [batch * beam_width, vocab_size]
             logits = top_p_sampling(logits, p=top_p)
@@ -1363,7 +1327,6 @@ def generate_step(model, tokenizer, encoder_input_ids, decoder_input_ids, max_to
     # Seleccionar la secuencia con la mejor puntuación
     best_sequences = sequences[torch.arange(sequences.size(0)), scores.argmin(dim=-1)]
     return tokenizer.decode(best_sequences[0], skip_special_tokens=True)
-
 
 def analyze_step(step_text):
     math_operations = len(re.findall(r'[\+\-\*/\^]', step_text))
@@ -1410,22 +1373,12 @@ def apply_repetition_penalty(logits, sequence, penalty=1.2):
 def calculate_coherence(question, cot_steps, response):
     try:
         full_text = question + " " + " ".join([step["text"] for step in cot_steps]) + " " + response
-        
+
         if not full_text.strip():
             return float('-inf')
 
-        math_elements = re.findall(r'\d+|[\+\-\*/\^]', full_text)
-        math_score = len(math_elements) / len(full_text.split()) if full_text.split() else 0
-
-        step_scores = [len(step["text"].split()) for step in cot_steps]
-        step_score = sum(step_scores) / len(step_scores) if step_scores else 0
-
-        progression_score = evaluate_progression(cot_steps)
-
-        response_score = evaluate_response(cot_steps, response)
-
-        coherence_score = (0.3 * math_score + 0.2 * step_score + 0.3 * progression_score + 0.2 * response_score)
-
+        coherence_score = 0.0
+        # Puedes implementar una evaluación más sofisticada si lo deseas
         return coherence_score
 
     except (TypeError, KeyError) as e:
@@ -1434,41 +1387,6 @@ def calculate_coherence(question, cot_steps, response):
         print(f"cot_steps: {cot_steps}")
         print(f"response: {response}")
         return float('-inf')
-
-def evaluate_progression(cot_steps):
-    if len(cot_steps) < 2:
-        return 0
-    
-    progression_scores = []
-    for i in range(1, len(cot_steps)):
-        prev_step = cot_steps[i-1]["text"]
-        curr_step = cot_steps[i]["text"]
-        
-        prev_numbers = set(re.findall(r'\d+', prev_step))
-        curr_numbers = set(re.findall(r'\d+', curr_step))
-        number_overlap = len(prev_numbers.intersection(curr_numbers))
-        
-        progression_keywords = ["por lo tanto", "entonces", "siguiente", "ahora", "utilizando"]
-        keyword_score = sum(1 for keyword in progression_keywords if keyword in curr_step.lower())
-        
-        progression_scores.append((number_overlap + keyword_score) / (len(prev_numbers) + len(progression_keywords)))
-    
-    return sum(progression_scores) / len(progression_scores)
-
-def evaluate_response(cot_steps, response):
-    if not cot_steps:
-        return 0
-    
-    last_step = cot_steps[-1]["text"]
-    last_step_numbers = set(re.findall(r'\d+', last_step))
-    response_numbers = set(re.findall(r'\d+', response))
-    
-    number_overlap = len(last_step_numbers.intersection(response_numbers))
-    
-    conclusion_keywords = ["resultado", "respuesta", "solución", "por lo tanto", "en conclusión"]
-    keyword_score = sum(1 for keyword in conclusion_keywords if keyword in response.lower())
-    
-    return (number_overlap + keyword_score) / (len(last_step_numbers) + len(conclusion_keywords))
 
 def get_model_device(model):
     return next(model.parameters()).device
@@ -1537,68 +1455,41 @@ def analyze_token_transformations(model, tokenizer, prompt):
     print("\nAnálisis de transformación de tokens completado.")
 
 if __name__ == "__main__":
-    # Número máximo de muestras a utilizar para el entrenamiento
-    # Implicaciones: Controla el tamaño del dataset de entrenamiento
-    # Ajuste: Aumentar para mejorar el rendimiento, pero también aumenta el tiempo de entrenamiento y los requisitos de memoria
-    # Rango recomendado: 1000-100000, dependiendo de los recursos disponibles
-    max_samples = 10000
-    model, tokenizer = main(max_samples=max_samples)
-
-    # Selección del dispositivo (GPU si está disponible, CPU en caso contrario)
+    model, tokenizer = main(max_samples=100)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Cálculo del número total de parámetros del modelo
-    # Útil para estimar la complejidad del modelo y los requisitos de memoria
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model.to(device)
     print(f"Total parameters: {total_params}")
-
-    # Ejemplo de prompt para análisis de transformaciones de tokens
-    # Puede modificarse para analizar diferentes tipos de entradas
-    prompt = "Resuelve la siguiente ecuación: 2x + 5 = 15"
+    
+    # Ejemplo de uso
+    prompt = "Escribe un cuento corto sobre una aventura en el bosque."
     analyze_token_transformations(model, tokenizer, prompt)
-
-    # Lista de prompts para generar soluciones matemáticas
-    # Puede expandirse o modificarse para probar diferentes tipos de problemas
     cot_prompts = [
-        "Instrucción: Resuelve el siguiente problema matemático.\nEntrada: Si una bicicleta cuesta $120 y pago con un billete de $200, ¿cuánto cambio recibiré?\nRazonamiento:",
-        "Instrucción: Explica el teorema de Pitágoras.\nEntrada: \nRazonamiento:",
+        "Instrucción: Genera una historia sobre un héroe que salva su aldea.\nEntrada: \nRazonamiento:",
+        "Instrucción: Describe los pasos para preparar una taza de té.\nEntrada: \nRazonamiento:",
     ]
 
-    # Inicialización del evaluador matemático
-    evaluator = MathEvaluator()
+    evaluator = TextEvaluator()
 
-    print("Generando soluciones matemáticas con Chain of Thought:\n")
+    print("Generando soluciones con Chain of Thought:\n")
     
     for question in cot_prompts:
-        # Generación de respuestas utilizando el modelo
         response, cot_steps, coherence_score = unified_generate(
             model, tokenizer, question, device, 
             reasoning=True,
-            max_step_tokens=70,  # Máximo número de tokens por paso de razonamiento
-                                 # Ajuste: 50-100, dependiendo de la complejidad deseada de cada paso
-            max_answer_tokens=30,  # Máximo número de tokens para la respuesta final
-                                   # Ajuste: 20-50, según la longitud deseada de la respuesta
-            temperature=0.7,  # Controla la aleatoriedad de la generación
-                              # Ajuste: 0.5-1.0, valores más bajos para respuestas más deterministas
-            top_k=50,  # Número de tokens más probables a considerar en cada paso
-                       # Ajuste: 20-100, valores más bajos para mayor coherencia
-            num_steps=3,  # Número de pasos de razonamiento
-                          # Ajuste: 2-5, según la complejidad del problema
-            max_attempts=4,  # Número máximo de intentos de generación
-                             # Ajuste: 1-5, aumentar si hay fallos frecuentes
-            beam_width=5,  # Número de beams en la búsqueda de beam
-                           # Ajuste: 1-10, valores más altos para potencialmente mejor calidad
-            top_p=0.9,  # Umbral de probabilidad acumulativa para muestreo nucleico
-                        # Ajuste: 0.7-1.0, valores más bajos para mayor coherencia
-            repetition_penalty=0.8,  # Penalización para la repetición de tokens
-                                     # Ajuste: 0.8-1.2, valores más altos para desalentar repeticiones
-            num_iterations=2,  # Número de iteraciones de refinamiento
-                               # Ajuste: 1-5, más iteraciones pueden mejorar la calidad pero aumentan el tiempo
+            max_step_tokens=70, 
+            max_answer_tokens=30, 
+            temperature=0.7, 
+            top_k=50, 
+            num_steps=3, 
+            max_attempts=4,
+            beam_width=5,
+            top_p=0.9,
+            repetition_penalty=0.8,
+            num_iterations=2,
             evaluator=evaluator
         )
-
-        # Impresión de resultados
         print(f"Pregunta:\n{question}\nRespuesta:\n{response}")
         print("Pasos de razonamiento:")
         for step in cot_steps:
