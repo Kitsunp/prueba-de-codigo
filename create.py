@@ -11,8 +11,8 @@ Este script implementa un modelo de lenguaje que utiliza técnicas avanzadas com
 El modelo está diseñado para manejar eficientemente secuencias largas y adaptar
 su comportamiento basándose en la complejidad de la entrada.
 
-Autor: [Tu Nombre]
-Fecha: [Fecha Actual]
+Autor: [Kitsunp]
+Fecha: [17/10/2024]
 Versión: 1.0
 """
 
