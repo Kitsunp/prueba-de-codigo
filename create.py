@@ -17,30 +17,39 @@ Versión: 1.0
 """
 
 # Importaciones
-import re  # Módulo para operaciones con expresiones regulares
-import numpy as np  # Biblioteca para operaciones numéricas
-import torch  # Framework principal de deep learning
-import torch.nn as nn  # Módulo de PyTorch para redes neuronales
-import torch.nn.functional as F  # Funciones de PyTorch para redes neuronales
-import torch.optim as optim  # Optimizadores de PyTorch
-from datasets import load_dataset  # Función para cargar datasets
-from transformers import GPT2Tokenizer, AutoModelForSequenceClassification, AutoTokenizer  # Componentes de Hugging Face Transformers
-from torch.utils.data import DataLoader  # Clase para cargar datos en batches
-from tqdm import tqdm  # Barra de progreso para bucles
-from torch.cuda.amp import autocast, GradScaler  # Herramientas para entrenamiento con precisión mixta
-from torch.optim.lr_scheduler import CosineAnnealingLR  # Planificador de tasa de aprendizaje
-import nltk  # Toolkit para procesamiento de lenguaje natural
+from collections import OrderedDict
+import hashlib
+import hashlib
+import math
+import os
+import re
+
+from datasets import load_dataset
+from flash_attn import flash_attn_func, flash_attn_qkvpacked_func
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
+import numpy as np
+import numpy as np
+from rouge_score import rouge_scorer
+from sklearn.metrics import f1_score, precision_score, recall_score
+import torch
+from torch.cuda.amp import GradScaler, autocast
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.checkpoint import checkpoint
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    GPT2Tokenizer,
+)  # Toolkit para procesamiento de lenguaje natural
 nltk.download('all')  # Descarga todos los recursos de NLTK
-from torch.utils.tensorboard import SummaryWriter  # Herramienta para visualización de métricas
-import math  # Módulo para operaciones matemáticas
-import os  # Módulo para operaciones del sistema operativo
-from nltk.tokenize import word_tokenize  # Función para tokenización de palabras
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction  # Herramientas para calcular BLEU score
-from rouge_score import rouge_scorer  # Herramienta para calcular ROUGE score
-from sklearn.metrics import f1_score, precision_score, recall_score  # Métricas de evaluación
-from flash_attn import flash_attn_qkvpacked_func, flash_attn_func  # Funciones de atención rápida
-import hashlib  # Módulo para generar hashes
-from torch.utils.checkpoint import checkpoint  # Función para checkpointing en redes neuronales
+  # Función para checkpointing en redes neuronales
 
 # Configuración global
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # Determina si usar GPU o CPU
@@ -1291,37 +1300,68 @@ def prepare_data(max_samples=None, val_size=0.1):
     return tokenizer, train_val_dataset
 
 def calculate_metrics(model, data_loader, criterion, device, tokenizer):
-    model.eval()
-    total_loss = 0
-    total_recon_loss = 0
-    total_entropy_loss = 0
-    total_tokens = 0
-    with torch.no_grad():
-        for batch in data_loader:
+    """
+    Calcula las métricas de evaluación para el modelo.
+
+    Args:
+        model (nn.Module): El modelo a evaluar.
+        data_loader (DataLoader): Cargador de datos de validación.
+        criterion (nn.Module): Función de pérdida.
+        device (torch.device): Dispositivo en el que realizar los cálculos.
+        tokenizer (Tokenizer): Tokenizador usado para procesar los datos.
+
+    Returns:
+        Tuple[float, float]: Pérdida promedio y perplejidad.
+    """
+    model.eval()  # Establece el modelo en modo de evaluación
+    total_loss = 0  # Inicializa la pérdida total
+    total_recon_loss = 0  # Inicializa la pérdida de reconstrucción total
+    total_entropy_loss = 0  # Inicializa la pérdida de entropía total
+    total_tokens = 0  # Inicializa el contador total de tokens
+
+    with torch.no_grad():  # Desactiva el cálculo de gradientes
+        for batch in data_loader:  # Itera sobre los lotes de datos
+            # Mueve los datos al dispositivo apropiado
             encoder_input_ids = batch['input_ids'].to(device)
             decoder_input_ids = batch['decoder_input_ids'].to(device)
             labels = batch['labels'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             
-            with autocast(enabled=True):
+            with autocast(enabled=True):  # Habilita la precisión mixta automática
+                # Realiza la pasada hacia adelante del modelo
                 outputs, recon_loss_enc, recon_loss_dec, entropy_loss_enc, entropy_loss_dec = model(encoder_input_ids, decoder_input_ids)
-                logits = outputs.reshape(-1, outputs.size(-1))
-                labels_flat = labels.reshape(-1)
+                logits = outputs.reshape(-1, outputs.size(-1))  # Reshape los logits
+                labels_flat = labels.reshape(-1)  # Aplana las etiquetas
                 
+                # Crea una máscara para ignorar los tokens de padding
                 mask = labels_flat != -100
                 logits = logits[mask]
                 labels_flat = labels_flat[mask]
                 
+                # Calcula la pérdida total
                 loss = criterion(logits, labels_flat) + recon_loss_enc + recon_loss_dec + entropy_loss_enc + entropy_loss_dec
-                total_loss += loss.item() * labels_flat.numel()
-                total_tokens += labels_flat.numel()
+                total_loss += loss.item() * labels_flat.numel()  # Acumula la pérdida
+                total_tokens += labels_flat.numel()  # Cuenta los tokens
     
-    avg_loss = total_loss / total_tokens
-    perplexity = math.exp(avg_loss)
-    return avg_loss, perplexity
+    avg_loss = total_loss / total_tokens  # Calcula la pérdida promedio
+    perplexity = math.exp(avg_loss)  # Calcula la perplejidad
 
+    return avg_loss, perplexity
 class OptimizedFocalLoss(nn.Module):
+    """
+    Implementa una versión optimizada de la Focal Loss con suavizado de etiquetas.
+    """
+
     def __init__(self, alpha=1, gamma=2, ignore_index=-100, label_smoothing=0.1):
+        """
+        Inicializa la función de pérdida Focal Loss optimizada.
+
+        Args:
+            alpha (float): Factor de balanceo.
+            gamma (float): Factor de enfoque.
+            ignore_index (int): Índice a ignorar en el cálculo de la pérdida.
+            label_smoothing (float): Factor de suavizado de etiquetas.
+        """
         super(OptimizedFocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -1329,91 +1369,129 @@ class OptimizedFocalLoss(nn.Module):
         self.label_smoothing = label_smoothing
 
     def forward(self, inputs, targets):
-        with torch.set_grad_enabled(self.training):
-            num_classes = inputs.size(-1)
+        """
+        Calcula la Focal Loss.
+
+        Args:
+            inputs (Tensor): Predicciones del modelo.
+            targets (Tensor): Etiquetas verdaderas.
+
+        Returns:
+            Tensor: Valor de la pérdida calculada.
+        """
+        with torch.set_grad_enabled(self.training):  # Habilita/deshabilita el cálculo de gradientes según el modo
+            num_classes = inputs.size(-1)  # Obtiene el número de clases
             
-            chunk_size = 1024
-            total_loss = 0
-            total_count = 0
+            chunk_size = 1024  # Tamaño del chunk para procesamiento por lotes
+            total_loss = 0  # Inicializa la pérdida total
+            total_count = 0  # Inicializa el contador total
             
-            for i in range(0, inputs.size(0), chunk_size):
-                chunk_inputs = inputs[i:i+chunk_size]
-                chunk_targets = targets[i:i+chunk_size]
+            for i in range(0, inputs.size(0), chunk_size):  # Procesa los datos en chunks
+                chunk_inputs = inputs[i:i+chunk_size]  # Obtiene un chunk de entradas
+                chunk_targets = targets[i:i+chunk_size]  # Obtiene un chunk de objetivos
                 
+                # Aplica suavizado de etiquetas
                 smoothed_targets = torch.zeros_like(chunk_inputs)
                 smoothed_targets.scatter_(1, chunk_targets.unsqueeze(1), 1)
                 smoothed_targets.mul_(1 - self.label_smoothing).add_(self.label_smoothing / num_classes)
                 
-                with torch.cuda.amp.autocast(enabled=True):
-                    log_probs = F.log_softmax(chunk_inputs, dim=-1)
-                    loss = -smoothed_targets * log_probs
+                with torch.cuda.amp.autocast(enabled=True):  # Habilita la precisión mixta automática
+                    log_probs = F.log_softmax(chunk_inputs, dim=-1)  # Calcula log-probabilidades
+                    loss = -smoothed_targets * log_probs  # Calcula la pérdida
                     
-                    loss = loss.sum(-1)
-                    pt = torch.exp(-loss)
-                    focal_loss = self.alpha * (1-pt)**self.gamma * loss
+                    loss = loss.sum(-1)  # Suma sobre todas las clases
+                    pt = torch.exp(-loss)  # Calcula la probabilidad de la clase correcta
+                    focal_loss = self.alpha * (1-pt)**self.gamma * loss  # Aplica Focal Loss
                     
-                    if self.ignore_index >= 0:
+                    if self.ignore_index >= 0:  # Si hay un índice a ignorar
                         mask = chunk_targets != self.ignore_index
                         focal_loss = focal_loss[mask]
                     
-                    total_loss += focal_loss.sum()
-                    total_count += focal_loss.numel()
+                    total_loss += focal_loss.sum()  # Acumula la pérdida
+                    total_count += focal_loss.numel()  # Cuenta el número de elementos
             
-            return total_loss / total_count if total_count > 0 else total_loss
-
+            return total_loss / total_count if total_count > 0 else total_loss  # Devuelve la pérdida promedio
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, scaler, device, num_epochs, accumulation_steps=8, evaluator=None, tokenizer=None, monitor=None):
-    writer = SummaryWriter()
-    best_val_loss = float('inf')
-    patience = 3
-    no_improve = 0
+    """
+    Entrena el modelo LiquidFoundation.
 
-    for epoch in range(num_epochs):
-        model.train()
-        total_loss = 0
-        total_recon_loss = 0
-        total_entropy_loss = 0
-        total_batches = 0
+    Args:
+        model (nn.Module): El modelo a entrenar.
+        train_loader (DataLoader): Cargador de datos de entrenamiento.
+        val_loader (DataLoader): Cargador de datos de validación.
+        criterion (nn.Module): Función de pérdida.
+        optimizer (Optimizer): Optimizador.
+        scheduler (LRScheduler): Planificador de tasa de aprendizaje.
+        scaler (GradScaler): Escalador de gradientes para precisión mixta.
+        device (torch.device): Dispositivo en el que realizar el entrenamiento.
+        num_epochs (int): Número de épocas de entrenamiento.
+        accumulation_steps (int): Pasos de acumulación de gradientes.
+        evaluator (TextEvaluator, optional): Evaluador de texto.
+        tokenizer (Tokenizer, optional): Tokenizador.
+        monitor (ActivationMonitor, optional): Monitor de activaciones.
+
+    Returns:
+        None
+    """
+    writer = SummaryWriter()  # Inicializa el escritor de TensorBoard
+    best_val_loss = float('inf')  # Inicializa la mejor pérdida de validación
+    patience = 3  # Paciencia para early stopping
+    no_improve = 0  # Contador para early stopping
+
+    for epoch in range(num_epochs):  # Itera sobre las épocas
+        model.train()  # Establece el modelo en modo de entrenamiento
+        total_loss = 0  # Inicializa la pérdida total
+        total_recon_loss = 0  # Inicializa la pérdida de reconstrucción total
+        total_entropy_loss = 0  # Inicializa la pérdida de entropía total
+        total_batches = 0  # Inicializa el contador de lotes
         
+        # Crea una barra de progreso
         loop = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Entrenando Epoch {epoch + 1}")
         
-        for batch_idx, batch in loop:
+        for batch_idx, batch in loop:  # Itera sobre los lotes
+            # Mueve los datos al dispositivo apropiado
             encoder_input_ids = batch['input_ids'].to(device)
             decoder_input_ids = batch['decoder_input_ids'].to(device)
             labels = batch['labels'].to(device)
 
-            with autocast(enabled=True):
+            with autocast(enabled=True):  # Habilita la precisión mixta automática
+                # Realiza la pasada hacia adelante
                 outputs, recon_loss_enc, recon_loss_dec, entropy_loss_enc, entropy_loss_dec = model(encoder_input_ids, decoder_input_ids)
-                logits = outputs.reshape(-1, outputs.size(-1))
-                labels_flat = labels.reshape(-1)
+                logits = outputs.reshape(-1, outputs.size(-1))  # Reshape los logits
+                labels_flat = labels.reshape(-1)  # Aplana las etiquetas
                 
+                # Crea una máscara para ignorar los tokens de padding
                 mask = labels_flat != -100
                 logits = logits[mask]
                 labels_flat = labels_flat[mask]
                 
+                # Calcula la pérdida
                 loss = criterion(logits, labels_flat) + recon_loss_enc + recon_loss_dec + entropy_loss_enc + entropy_loss_dec
-                loss = loss / accumulation_steps
+                loss = loss / accumulation_steps  # Normaliza la pérdida
 
+            # Realiza la retropropagación
             scaler.scale(loss).backward()
 
-            if (batch_idx + 1) % accumulation_steps == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+            if (batch_idx + 1) % accumulation_steps == 0:  # Actualiza los pesos cada accumulation_steps
+                scaler.unscale_(optimizer)  # Deshace la escala de los gradientes
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Recorta los gradientes
+                scaler.step(optimizer)  # Realiza un paso de optimización
+                scaler.update()  # Actualiza el factor de escala
+                optimizer.zero_grad()  # Reinicia los gradientes
 
+            # Acumula las pérdidas
             total_loss += loss.item() * accumulation_steps
             total_recon_loss += (recon_loss_enc + recon_loss_dec).item() * accumulation_steps
             total_entropy_loss += (entropy_loss_enc + entropy_loss_dec).item() * accumulation_steps
             total_batches += 1
 
-            if monitor and (batch_idx + 1) % 800 == 0:
+            if monitor and (batch_idx + 1) % 800 == 0:  # Registra activaciones y gradientes periódicamente
                 for name, activation in monitor.activations.items():
                     writer.add_histogram(f'Activations/{name}', activation.cpu().numpy(), epoch)
                 for name, gradient in monitor.gradients.items():
                     writer.add_histogram(f'Gradients/{name}', gradient.cpu().numpy(), epoch)
 
-            if (batch_idx + 1) % 800 == 0:
+            if (batch_idx + 1) % 800 == 0:  # Evalúa y registra métricas periódicamente
                 avg_train_loss = total_loss / total_batches
                 avg_recon_loss = total_recon_loss / total_batches
                 avg_entropy_loss = total_entropy_loss / total_batches
@@ -1421,13 +1499,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 
                 loop.set_postfix(train_loss=avg_train_loss, recon_loss=avg_recon_loss, entropy_loss=avg_entropy_loss, val_loss=val_loss, val_perplexity=val_perplexity)
 
-            if (batch_idx + 1) % 100 == 0:
+            if (batch_idx + 1) % 100 == 0:  # Registra el uso de expertos periódicamente
                 for idx, layer in enumerate(model.encoder.layers):
                     usage_stats = layer.moe.get_expert_usage_stats()
                     print(f"Epoch {epoch}, Batch {batch_idx+1}, Layer {idx} Expert Usage: {usage_stats}")
 
-        scheduler.step()
+        scheduler.step()  # Actualiza la tasa de aprendizaje
 
+        # Calcula y registra las métricas de entrenamiento
         avg_train_loss = total_loss / total_batches
         avg_recon_loss = total_recon_loss / total_batches
         avg_entropy_loss = total_entropy_loss / total_batches
@@ -1435,13 +1514,15 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         writer.add_scalar('Loss/recon', avg_recon_loss, epoch)
         writer.add_scalar('Loss/entropy', avg_entropy_loss, epoch)
 
+        # Calcula y registra las métricas de validación
         val_loss, val_perplexity = calculate_metrics(model, val_loader, criterion, device, tokenizer)
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('Perplexity/val', val_perplexity, epoch)
 
-        if evaluator and tokenizer:
+        if evaluator and tokenizer:  # Realiza evaluación adicional si se proporciona un evaluador
             evaluate_model(model, val_loader, evaluator, tokenizer, device, writer, epoch)
         
+        # Imprime las métricas de la época
         print(f"Epoch {epoch + 1}/{num_epochs}")
         print(f"Train Loss: {avg_train_loss:.4f}")
         print(f"Train Recon Loss: {avg_recon_loss:.4f}")
@@ -1449,6 +1530,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         print(f"Validation Loss: {val_loss:.4f}")
         print(f"Validation Perplexity: {val_perplexity:.2f}")
 
+        # Guarda el mejor modelo y verifica early stopping
         if val_perplexity < best_val_loss:
             best_val_loss = val_perplexity
             no_improve = 0
@@ -1460,11 +1542,22 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             print("Early stopping")
             break
 
-        torch.cuda.empty_cache()
+        torch.cuda.empty_cache()  # Libera la memoria de la GPU
 
-    writer.close()
-
+    writer.close()  # Cierra el escritor de TensorBoard
 def calculate_evaluation_metrics(evaluator, questions, answers, labels):
+    """
+    Calcula métricas de evaluación utilizando el evaluador de texto.
+
+    Args:
+        evaluator (TextEvaluator): Instancia del evaluador de texto.
+        questions (list): Lista de preguntas o prompts.
+        answers (list): Lista de respuestas generadas.
+        labels (list): Lista de etiquetas o respuestas correctas.
+
+    Returns:
+        dict: Diccionario con las métricas calculadas.
+    """
     metrics = evaluator.calculate_metrics(questions, answers, labels)
     coherence = np.mean([evaluator.evaluate_coherence(q, [], a) for q, a in zip(questions, answers)])
     metrics['coherence'] = coherence
@@ -1475,6 +1568,18 @@ def print_metrics(metrics):
         print(f"{metric.capitalize()}: {value:.4f}")
 
 def evaluate_model(model, val_loader, evaluator, tokenizer, device, writer, epoch):
+    """
+    Evalúa el modelo utilizando métricas personalizadas.
+
+    Args:
+        model (nn.Module): Modelo a evaluar.
+        val_loader (DataLoader): Cargador de datos de validación.
+        evaluator (TextEvaluator): Instancia del evaluador de texto.
+        tokenizer (Tokenizer): Tokenizador utilizado.
+        device (torch.device): Dispositivo en el que realizar la evaluación.
+        writer (SummaryWriter): Escritor de TensorBoard.
+        epoch (int): Época actual.
+    """
     model.eval()
     all_questions = []
     all_answers = []
@@ -1508,6 +1613,15 @@ def evaluate_model(model, val_loader, evaluator, tokenizer, device, writer, epoc
     print_metrics(metrics)
 
 def resize_embeddings(model, tokenizer, new_vocab_size, embed_dim):
+    """
+    Redimensiona los embeddings del modelo para acomodar nuevos tokens.
+
+    Args:
+        model (nn.Module): Modelo a modificar.
+        tokenizer (Tokenizer): Tokenizador actualizado.
+        new_vocab_size (int): Nuevo tamaño del vocabulario.
+        embed_dim (int): Dimensión de los embeddings.
+    """
     old_embedding = model.encoder.embedding.token_embedding
     new_embedding = nn.Embedding(new_vocab_size, embed_dim)
     
@@ -1516,7 +1630,6 @@ def resize_embeddings(model, tokenizer, new_vocab_size, embed_dim):
         nn.init.normal_(new_embedding.weight.data[old_embedding.num_embeddings:, :], mean=0.0, std=0.02)
     
     model.encoder.embedding.token_embedding = new_embedding.to(device)
-    
     model.decoder_embedding.token_embedding = new_embedding.to(device)
     
     model.output_layer = nn.Linear(embed_dim, new_vocab_size).to(device)
@@ -1526,16 +1639,29 @@ def resize_embeddings(model, tokenizer, new_vocab_size, embed_dim):
     
     print(f"Capa de salida actualizada: {model.output_layer}")
 
+
 def main(max_samples=10000):
+    """
+    Función principal para entrenar y evaluar el modelo LiquidFoundation.
+
+    Args:
+        max_samples (int): Número máximo de muestras a utilizar para el entrenamiento.
+
+    Returns:
+        Tuple[nn.Module, Tokenizer]: El modelo entrenado y el tokenizador.
+    """
+    # Prepara los datos
     tokenizer, train_val_dataset = prepare_data(max_samples)
     
-    VOCAB_SIZE = len(tokenizer)
+    VOCAB_SIZE = len(tokenizer)  # Obtiene el tamaño del vocabulario
     
     print(f"Tamaño del vocabulario: {VOCAB_SIZE}")
 
+    # Crea los cargadores de datos
     train_loader = DataLoader(train_val_dataset['train'], batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(train_val_dataset['test'], batch_size=BATCH_SIZE, shuffle=False)
 
+    # Inicializa el modelo
     model = LiquidFoundationModelOptimized(
         vocab_size=VOCAB_SIZE,
         embed_dim=EMBED_DIM,
@@ -1554,20 +1680,22 @@ def main(max_samples=10000):
         lstm_num_layers=2      # Número de capas del EnhancedLSTM
     ).to(device)
 
+    # Redimensiona los embeddings para tokens especiales
     resize_embeddings(model, tokenizer, VOCAB_SIZE, EMBED_DIM)
     print("Se actualizó el tamaño del embedding para tokens especiales sin perder los pesos existentes.")
 
     print(f"Dimensión de output_layer: {model.output_layer.weight.shape}")
 
+    # Inicializa el criterio, optimizador, planificador y escalador
     criterion = OptimizedFocalLoss(ignore_index=-100, label_smoothing=0.1)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     scaler = GradScaler()
 
     evaluator = TextEvaluator()
-
     monitor = ActivationMonitor(model)
 
+    # Entrena el modelo
     train_model(
         model, 
         train_loader, 
@@ -1588,34 +1716,136 @@ def main(max_samples=10000):
 
     return model, tokenizer
 
-from collections import OrderedDict
-import hashlib
-import numpy as np
-
 class DynamicCacheManager:
+    """
+    DynamicCacheManager: Un sistema de caché avanzado con compresión dinámica.
+
+    Esta clase implementa un sistema de caché que utiliza compresión dinámica basada en la
+    complejidad de los datos para optimizar el almacenamiento. Utiliza la Transformada Rápida
+    de Fourier (FFT) para comprimir y descomprimir datos, y emplea una política de reemplazo
+    Least Recently Used (LRU) para gestionar el tamaño del caché.
+
+    Atributos:
+        cache (OrderedDict): Estructura de datos ordenada que almacena los items cacheados.
+                             La ordenación se utiliza para implementar la política LRU.
+        max_size (int): Número máximo de elementos que puede contener el caché.
+        base_compression_ratio (float): Ratio de compresión base utilizado en el algoritmo de compresión.
+        min_compression_ratio (float): Ratio de compresión mínimo para evitar una compresión excesiva.
+
+    Métodos:
+        __init__: Inicializa el DynamicCacheManager.
+        _generate_key: Genera una clave única para cada conjunto de parámetros de generación.
+        _calculate_complexity: Calcula la complejidad de un array de datos.
+        _compress_data: Comprime los datos utilizando FFT y compresión dinámica.
+        _decompress_data: Descomprime los datos previamente comprimidos.
+        get: Recupera un item del caché.
+        set: Almacena un item en el caché.
+    """
+
     def __init__(self, max_size=1000, base_compression_ratio=0.5, min_compression_ratio=0.1):
-        self.cache = OrderedDict()  # Utiliza OrderedDict para mantener el orden de uso
-        self.max_size = max_size
-        self.base_compression_ratio = base_compression_ratio
-        self.min_compression_ratio = min_compression_ratio
+        """
+        Inicializa el DynamicCacheManager.
+
+        Args:
+            max_size (int): Tamaño máximo del caché. Por defecto es 1000.
+            base_compression_ratio (float): Ratio de compresión base. Por defecto es 0.5.
+            min_compression_ratio (float): Ratio de compresión mínimo. Por defecto es 0.1.
+
+        El constructor inicializa el caché como un OrderedDict vacío y establece los
+        parámetros de compresión. El uso de OrderedDict permite mantener un orden de
+        inserción/acceso, crucial para implementar la política LRU.
+        """
+        self.cache = OrderedDict()  # Inicializa un diccionario ordenado vacío para el caché
+        self.max_size = max_size  # Establece el tamaño máximo del caché
+        self.base_compression_ratio = base_compression_ratio  # Establece el ratio de compresión base
+        self.min_compression_ratio = min_compression_ratio  # Establece el ratio de compresión mínimo
 
     def _generate_key(self, prompt, max_length, beam_width, temperature, top_p, repetition_penalty, max_step_tokens, max_answer_tokens, top_k, num_steps):
+        """
+        Genera una clave única para un conjunto específico de parámetros de generación.
+
+        Args:
+            prompt (str): El prompt de entrada.
+            max_length (int): Longitud máxima de la secuencia generada.
+            beam_width (int): Ancho del beam search.
+            temperature (float): Temperatura para el muestreo.
+            top_p (float): Valor para el muestreo nucleus.
+            repetition_penalty (float): Penalización por repetición.
+            max_step_tokens (int): Número máximo de tokens por paso.
+            max_answer_tokens (int): Número máximo de tokens en la respuesta.
+            top_k (int): Valor para el muestreo top-k.
+            num_steps (int): Número de pasos de generación.
+
+        Returns:
+            str: Una clave hash MD5 única generada a partir de los parámetros.
+
+        Este método crea una representación de string de todos los parámetros y luego
+        genera un hash MD5 de este string. Esto asegura que cada conjunto único de
+        parámetros tenga una clave única en el caché, permitiendo una recuperación
+        precisa de resultados previamente generados.
+        """
+        # Crea un string que concatena todos los parámetros
         key = f"{prompt}_{max_length}_{beam_width}_{temperature}_{top_p}_{repetition_penalty}_{max_step_tokens}_{max_answer_tokens}_{top_k}_{num_steps}"
+        # Genera y devuelve un hash MD5 del string
         return hashlib.md5(key.encode()).hexdigest()
 
     def _calculate_complexity(self, data_array):
+        """
+        Calcula la complejidad de un array de datos basándose en su espectro de frecuencia.
+
+        Args:
+            data_array (numpy.ndarray): Array de datos para el cual se calculará la complejidad.
+
+        Returns:
+            float: Un valor de complejidad entre 0 y 1.
+
+        Este método utiliza la Transformada Rápida de Fourier (FFT) para analizar el
+        contenido de frecuencia de los datos. La complejidad se determina por la
+        proporción de componentes de frecuencia significativas (por encima del 10%
+        de la magnitud máxima) en relación con el total de componentes.
+
+        Un valor de complejidad cercano a 1 indica datos con un espectro de frecuencia
+        rico (más complejos), mientras que un valor cercano a 0 indica datos con un
+        espectro de frecuencia más simple.
+        """
+        # Calcula la FFT del array de datos
         fft_result = np.fft.fft(data_array)
+        # Calcula la magnitud del espectro de frecuencia
         magnitude = np.abs(fft_result)
+        # Determina qué componentes de frecuencia son significativas (> 10% del máximo)
         complexity = (magnitude > 0.1 * magnitude.max()).mean()
         return complexity
 
     def _compress_data(self, data):
+        """
+        Comprime los datos utilizando FFT y compresión dinámica basada en la complejidad.
+
+        Args:
+            data (Union[tuple, str, list]): Datos a comprimir.
+
+        Returns:
+            Tuple[numpy.ndarray, float]: 
+                - Array comprimido de coeficientes FFT.
+                - Ratio de compresión dinámico utilizado.
+
+        Raises:
+            ValueError: Si el tipo de dato no es soportado para compresión.
+
+        Este método realiza los siguientes pasos:
+        1. Convierte los datos de entrada en un array numpy de bytes.
+        2. Calcula la complejidad de los datos.
+        3. Determina un ratio de compresión dinámico basado en la complejidad.
+        4. Aplica FFT a los datos.
+        5. Comprime los datos reteniendo solo una porción de los coeficientes FFT.
+
+        La compresión es más agresiva para datos menos complejos y más conservadora
+        para datos más complejos, optimizando así el equilibrio entre el tamaño de
+        almacenamiento y la fidelidad de los datos.
+        """
+        # Convierte los datos a un array numpy de bytes
         if isinstance(data, tuple):
-            # Convertir la tupla a una lista para procesarla
             data_list = list(data)
-            # Convertir cada elemento de la lista a bytes
             data_bytes = [str(item).encode() for item in data_list]
-            # Concatenar todos los bytes
             data_array = np.frombuffer(b''.join(data_bytes), dtype=np.uint8)
         elif isinstance(data, str):
             data_array = np.frombuffer(data.encode(), dtype=np.uint8)
@@ -1624,10 +1854,13 @@ class DynamicCacheManager:
         else:
             raise ValueError(f"Tipo de dato no soportado para compresión: {type(data)}")
 
+        # Calcula la complejidad de los datos
         complexity = self._calculate_complexity(data_array)
+        # Determina el ratio de compresión dinámico
         dynamic_compression_ratio = self.base_compression_ratio * (1 - complexity)
         dynamic_compression_ratio = max(self.min_compression_ratio, dynamic_compression_ratio)
 
+        # Aplica FFT y comprime reteniendo solo una porción de los coeficientes
         fft_result = np.fft.fft(data_array)
         compressed_size = int(len(fft_result) * dynamic_compression_ratio)
         compressed_fft = fft_result[:compressed_size]
@@ -1635,25 +1868,70 @@ class DynamicCacheManager:
         return compressed_fft, dynamic_compression_ratio
 
     def _decompress_data(self, compressed_data, compression_ratio, original_type):
+        """
+        Descomprime los datos previamente comprimidos.
+
+        Args:
+            compressed_data (numpy.ndarray): Datos comprimidos (coeficientes FFT).
+            compression_ratio (float): Ratio de compresión utilizado.
+            original_type (type): Tipo de dato original antes de la compresión.
+
+        Returns:
+            Union[str, list, tuple]: Datos descomprimidos en su tipo original.
+
+        Raises:
+            ValueError: Si el tipo de dato original no es soportado para descompresión.
+
+        Este método realiza la operación inversa de _compress_data:
+        1. Reconstruye el array FFT completo rellenando con ceros.
+        2. Aplica la FFT inversa para obtener los datos originales.
+        3. Convierte los datos de vuelta a su tipo original.
+
+        La descompresión intenta preservar la fidelidad de los datos originales,
+        pero puede haber alguna pérdida debido a la naturaleza de la compresión FFT.
+        """
+        # Reconstruye el array FFT completo
         full_size = int(len(compressed_data) / compression_ratio)
         reconstructed_fft = np.zeros(full_size, dtype=complex)
         reconstructed_fft[:len(compressed_data)] = compressed_data
 
+        # Aplica la FFT inversa
         decompressed_array = np.fft.ifft(reconstructed_fft).real.astype(np.uint8)
         decompressed_bytes = decompressed_array.tobytes()
 
+        # Convierte los datos de vuelta a su tipo original
         if original_type == str:
             return decompressed_bytes.decode()
         elif original_type == list:
             return decompressed_array.tolist()
         elif original_type == tuple:
-            # Dividir los bytes decomprimidos en sus componentes originales
+            # Divide los bytes descomprimidos en sus componentes originales
             components = decompressed_bytes.split(b'\x00')  # Asumimos que '\x00' separa los componentes
             return tuple(eval(comp.decode()) for comp in components if comp)
         else:
             raise ValueError(f"Tipo de dato no soportado para descompresión: {original_type}")
 
     def get(self, key):
+        """
+        Recupera un item del caché.
+
+        Args:
+            key (str): La clave del item a recuperar.
+
+        Returns:
+            Any: El item descomprimido si está en el caché, None si no está.
+
+        Este método busca un item en el caché usando la clave proporcionada.
+        Si el item está en el caché:
+        1. Mueve el item al final del OrderedDict (marcándolo como recientemente usado).
+        2. Descomprime los datos.
+        3. Devuelve los datos descomprimidos.
+
+        Si el item no está en el caché, devuelve None.
+
+        Este método implementa parte de la política LRU al mover los items accedidos
+        al final del OrderedDict.
+        """
         if key in self.cache:
             # Mover la clave al final para marcarla como recientemente usada
             self.cache.move_to_end(key)
@@ -1662,12 +1940,35 @@ class DynamicCacheManager:
         return None
 
     def set(self, key, value):
+        """
+        Almacena un item en el caché.
+
+        Args:
+            key (str): La clave bajo la cual almacenar el item.
+            value (Any): El valor a almacenar.
+
+        Este método realiza las siguientes operaciones:
+        1. Si la clave ya existe, mueve el item al final del OrderedDict.
+        2. Si el caché está lleno, elimina el item menos recientemente usado.
+        3. Comprime el valor.
+        4. Almacena el valor comprimido en el caché.
+
+        Este método implementa la política LRU completa:
+        - Mueve los items existentes al final cuando son actualizados.
+        - Elimina el item del principio (menos recientemente usado) cuando el caché está lleno.
+
+        La compresión se realiza para optimizar el uso de memoria, permitiendo
+        almacenar más items en el caché.
+        """
         if key in self.cache:
+            # Si la clave ya existe, moverla al final (recientemente usada)
             self.cache.move_to_end(key)
         elif len(self.cache) >= self.max_size:
+            # Si el caché está lleno, eliminar el item menos recientemente usado
             removed_key, _ = self.cache.popitem(last=False)
             print(f"Eliminada la entrada menos recientemente usada: {removed_key}")
         
+        # Comprimir y almacenar el valor
         original_type = type(value)
         compressed_data, compression_ratio = self._compress_data(value)
         self.cache[key] = (compressed_data, compression_ratio, original_type)
